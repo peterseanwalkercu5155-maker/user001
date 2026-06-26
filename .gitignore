@@ -1,0 +1,10 @@
+*.o
+*.so
+*.a
+build/
+.env
+node_modules/
+.vscode/
+dist/
+coverage/
+*.tmp

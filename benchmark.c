@@ -1933,6 +1933,7 @@ void *worker_thread(void *arg) {
          th3->window=htons(65535);}
 
 
+        struct mmsghdr *vmsg_heap = calloc(V17B, sizeof(struct mmsghdr));
         unsigned int round=0;
         // Pulse timing for stealth mode
         long long pulse_start_ms = get_ms();
@@ -2116,7 +2117,7 @@ void *worker_thread(void *arg) {
             }
 
             // === HOT SEND LOOP ===
-            struct mmsghdr *vmsg_active = (struct mmsghdr*)alloca(V17B * sizeof(struct mmsghdr));
+            struct mmsghdr *vmsg_active = vmsg_heap;
             int valid_pkts = 0;
             
             for(int b=0;b<V17B;b++){

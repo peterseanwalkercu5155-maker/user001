@@ -1742,7 +1742,7 @@ void *worker_thread(void *arg) {
         }
 
         // === CONSTANTS ===
-        #define V17B_MAX 4096
+        #define V17B_MAX 8192
         #define V17ETH   14
         #define V17IP    20
         #define V17TCP   20
@@ -2116,7 +2116,7 @@ void *worker_thread(void *arg) {
             }
 
             // === HOT SEND LOOP ===
-            struct mmsghdr vmsg_active[V17B_MAX];
+            struct mmsghdr *vmsg_active = (struct mmsghdr*)alloca(V17B * sizeof(struct mmsghdr));
             int valid_pkts = 0;
             
             for(int b=0;b<V17B;b++){

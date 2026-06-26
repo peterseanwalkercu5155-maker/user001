@@ -102,7 +102,7 @@ void apply_optimizations() {
 
 
 
-    if (args.is_v5_rapid || args.is_v6_void || args.is_v8_phantom || args.is_v7_pipe || args.is_v12_eclipse || args.is_v14_phantom) {
+    if (args.is_v5_rapid || args.is_v6_void || args.is_v8_phantom || args.is_v7_pipe || args.is_v12_eclipse || args.is_v14_phantom || args.is_v20_ws) {
         SSL_library_init();
         OpenSSL_add_all_algorithms();
         SSL_load_error_strings();

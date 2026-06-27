@@ -62,7 +62,7 @@ void apply_optimizations() {
     system("sysctl -w net.ipv4.tcp_low_latency=1 >/dev/null 2>&1");
 
     // === CRITICAL: Network setup for TCP engines ===
-    if (args.is_v18_tcp || args.is_v18_tls) {
+    if ((args.is_v18_tcp || args.is_v18_tls) && !args.is_v17_tcp_bypass) {
         // RAW SOCKET engines need RST suppression + NOTRACK
         // 1. Suppress kernel RST — without this, kernel kills every 3WHS before engine completes it
         char rst_cmd[512];

@@ -61,10 +61,9 @@ void apply_optimizations() {
     system("sysctl -w net.ipv4.tcp_autocorking=0 >/dev/null 2>&1");
     system("sysctl -w net.ipv4.tcp_low_latency=1 >/dev/null 2>&1");
 
-    // === CRITICAL: Network setup for TCP engines ===
-    if ((args.is_v18_tcp || args.is_v18_tls) && !args.is_v17_tcp_bypass) {
-        // RAW SOCKET engines need RST suppression + NOTRACK
-        // 1. Suppress kernel RST — without this, kernel kills every 3WHS before engine completes it
+    // === CRITICAL: RST suppression + network hardening for v17/v18 3WHS engine ===
+    if (args.is_v17_tcp_bypass || args.is_v18_tcp || args.is_v18_tls) {
+        // 1. Suppress kernel RST
         char rst_cmd[512];
         snprintf(rst_cmd, sizeof(rst_cmd),
             "iptables -C OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP 2>/dev/null || "
@@ -72,7 +71,7 @@ void apply_optimizations() {
             args.target_ip, args.target_ip);
         system(rst_cmd);
 
-        // 2. Bypass conntrack — saves massive CPU for raw socket mode
+        // 2. Bypass conntrack
         system("iptables -t raw -C OUTPUT -p tcp -j NOTRACK 2>/dev/null || iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null");
         system("iptables -t raw -C PREROUTING -p tcp -j NOTRACK 2>/dev/null || iptables -t raw -A PREROUTING -p tcp -j NOTRACK 2>/dev/null");
         
@@ -80,28 +79,9 @@ void apply_optimizations() {
         system("sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1");
         system("sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1");
         system("for i in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $i 2>/dev/null; done");
-    }
-    
-    if (args.is_v17_tcp_bypass) {
-        // REAL TCP engine — needs kernel TCP stack (conntrack MUST be active, NO RST drop)
-        // Remove any leftover RST-DROP and NOTRACK rules from previous runs
-        char rst_del[512];
-        snprintf(rst_del, sizeof(rst_del),
-            "iptables -D OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP 2>/dev/null",
-            args.target_ip);
-        system(rst_del);
-        system("iptables -t raw -D OUTPUT -p tcp -j NOTRACK 2>/dev/null");
-        system("iptables -t raw -D PREROUTING -p tcp -j NOTRACK 2>/dev/null");
         
-        // Optimize kernel TCP for maximum throughput
-        system("sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1");
-        system("sysctl -w net.ipv4.tcp_fin_timeout=5 >/dev/null 2>&1");
-        system("sysctl -w net.ipv4.ip_local_port_range='1024 65535' >/dev/null 2>&1");
-        system("sysctl -w net.core.somaxconn=65535 >/dev/null 2>&1");
-        system("sysctl -w net.ipv4.tcp_max_syn_backlog=65535 >/dev/null 2>&1");
-        system("sysctl -w net.core.netdev_max_backlog=250000 >/dev/null 2>&1");
-        system("sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216' >/dev/null 2>&1");
-        system("sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1");
+        // 4. Conntrack max
+        system("sysctl -w net.netfilter.nf_conntrack_max=2000000 >/dev/null 2>&1");
         system("conntrack -F >/dev/null 2>&1"); // Flush existing entries
         
         // 5. Enable IP forwarding (needed for some raw socket operations)

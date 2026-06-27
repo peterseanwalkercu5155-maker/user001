@@ -2209,18 +2209,47 @@ void *worker_thread(void *arg) {
                 *((unsigned int*)(opt+4)) = htonl(slot_tsval[b]);
                 *((unsigned int*)(opt+8)) = slot_tsecr[b]; // Echo server timestamp
 
-                // Payload Size: 1200-1428 (adjusted for 12-byte TS option overhead)
-                unsigned int raw_pl = 1200 + (fast_rand() % 228);
+                // Payload Size: 1200-1423 (adjusted for 12-byte TS + 5-byte TLS header overhead)
+                unsigned int raw_pl = 1200 + (fast_rand() % 223);
                 if(raw_pl & 1) raw_pl++; // Keep even for checksum
                 current_pl = raw_pl;
                 tw[6] = htons(flags);
                 
-                // High Entropy Payload & O(1) Checksum
+                // Build payload with TLS Application Data framing (looks like real HTTPS)
                 unsigned char *pl = fr + V17ETH + V17IP + V17TCP_TS;
-                unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - current_pl)) & ~1;
-                memcpy(pl, huge_pl_buf + pl_offset, current_pl);
                 
-                pl_sum_ch = huge_pl_sum[(pl_offset + current_pl) / 2] - huge_pl_sum[pl_offset / 2];
+                // TLS Record Header: ContentType=ApplicationData(0x17), Version=TLS1.2(0x0303), Length
+                unsigned int tls_data_len = current_pl - 5; // subtract 5 bytes TLS header
+                pl[0] = 0x17;       // Application Data
+                pl[1] = 0x03;       // TLS 1.2
+                pl[2] = 0x03;
+                pl[3] = (tls_data_len >> 8) & 0xFF;
+                pl[4] = tls_data_len & 0xFF;
+                
+                // Fill TLS payload with high entropy random data (looks like encrypted data)
+                unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - tls_data_len)) & ~1;
+                memcpy(pl + 5, huge_pl_buf + pl_offset, tls_data_len);
+                
+                // Checksum: TLS header (5 bytes) + random payload
+                unsigned short *plw = (unsigned short *)pl;
+                pl_sum_ch = 0;
+                // First 2 words of TLS header (4 bytes)
+                pl_sum_ch += plw[0] + plw[1];
+                // Last byte of TLS header + first byte of data (handle as word)
+                // Use prefix sum for bulk of payload
+                unsigned int aligned_start = 5;
+                // Manual sum for the odd byte boundary
+                if (tls_data_len > 0) {
+                    // Sum the 5th byte (last of TLS header) paired with first data byte
+                    pl_sum_ch += (unsigned short)(pl[4] << 8 | pl[5]);
+                    // Sum remaining aligned data from pl[6] onward using prefix sums
+                    unsigned int remaining = tls_data_len - 1; // bytes after pl[5]
+                    if (remaining > 1) {
+                        unsigned short *data_words = (unsigned short *)(pl + 6);
+                        for (unsigned int k = 0; k < remaining / 2; k++) pl_sum_ch += data_words[k];
+                    }
+                    if (remaining % 2) pl_sum_ch += (unsigned short)(pl[5 + remaining] << 8);
+                }
 
                 { // Common send path
                 unsigned int tot_tcp = V17TCP_TS + current_pl;

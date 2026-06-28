@@ -1926,7 +1926,7 @@ void *worker_thread(void *arg) {
 
         // Recv socket for SYN-ACK (3WHS completion)
         int fd_recv=-1;
-        int recv_off=V17ETH; // Ethernet header offset for AF_PACKET
+        int recv_off=14; // Ethernet header offset for AF_PACKET (V17ETH defined later)
         if(use_afp){
             fd_recv=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
         }

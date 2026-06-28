@@ -1880,23 +1880,34 @@ void *worker_thread(void *arg) {
                  break;}}
              fclose(fa);}}}
 
-        int use_afp=1;
-        int fd_send, fd_send2;
-        if(use_afp){
-            fd_send=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
+        int use_afp=0;
+        int fd_send=-1, fd_send2=-1;
+        // Tier 1: AF_PACKET + QDISC_BYPASS (fastest)
+        fd_send=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
+        if(fd_send>=0){
             struct sockaddr_ll sl={0};
             sl.sll_family=AF_PACKET;sl.sll_ifindex=ifindex;sl.sll_protocol=htons(ETH_P_IP);
             bind(fd_send,(struct sockaddr*)&sl,sizeof(sl));
             int q=1;setsockopt(fd_send,SOL_PACKET,PACKET_QDISC_BYPASS,&q,sizeof(q));
             fd_send2=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
-            bind(fd_send2,(struct sockaddr*)&sl,sizeof(sl));
-            setsockopt(fd_send2,SOL_PACKET,PACKET_QDISC_BYPASS,&q,sizeof(q));
-        } else {
-            fd_send=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
-            int h=1;setsockopt(fd_send,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
-            fd_send2=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
-            setsockopt(fd_send2,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
+            if(fd_send2>=0){
+                bind(fd_send2,(struct sockaddr*)&sl,sizeof(sl));
+                setsockopt(fd_send2,SOL_PACKET,PACKET_QDISC_BYPASS,&q,sizeof(q));
+                use_afp=1;
+            } else {
+                close(fd_send); fd_send=-1;
+            }
         }
+        // Tier 2: SOCK_RAW fallback (works on GitHub Actions)
+        if(!use_afp){
+            fd_send=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+            if(fd_send>=0){
+                int h=1;setsockopt(fd_send,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
+                fd_send2=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+                if(fd_send2>=0) setsockopt(fd_send2,IPPROTO_IP,IP_HDRINCL,&h,sizeof(h));
+            }
+        }
+        if(fd_send<0){LOG_ERR("T%d: no raw socket available",tid);return NULL;}
         {int sb=64*1024*1024;
          setsockopt(fd_send,SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
          setsockopt(fd_send2,SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
@@ -1914,24 +1925,51 @@ void *worker_thread(void *arg) {
         raw_dst.sin_port=bin_target_port; // not used by kernel for IPPROTO_RAW
 
         // Recv socket for SYN-ACK (3WHS completion)
-        int fd_recv=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
+        int fd_recv=-1;
+        int recv_off=V17ETH; // Ethernet header offset for AF_PACKET
+        if(use_afp){
+            fd_recv=socket(AF_PACKET,SOCK_RAW,htons(ETH_P_IP));
+        }
+        if(fd_recv<0){
+            // Fallback: SOCK_RAW recv (works on GitHub Actions)
+            fd_recv=socket(AF_INET,SOCK_RAW,IPPROTO_TCP);
+            recv_off=0; // No Ethernet header in SOCK_RAW
+        }
+        if(fd_recv<0){LOG_ERR("T%d: no recv socket",tid);return NULL;}
         {
-            struct sock_filter bpf_syn_ack[] = {
-                { 0x28, 0, 0, 0x0000000c },
-                { 0x15, 0, 5, 0x00000800 },
-                { 0x30, 0, 0, 0x00000017 },
-                { 0x15, 0, 3, 0x00000006 },
-                { 0x28, 0, 0, 0x00000014 },
-                { 0x45, 1, 0, 0x00001fff },
-                { 0xb1, 0, 0, 0x0000000e },
-                { 0x50, 0, 0, 0x0000001b },
-                { 0x54, 0, 0, 0x00000012 },
-                { 0x15, 0, 1, 0x00000012 },
-                { 0x6, 0, 0, 0x00040000 },
-                { 0x6, 0, 0, 0x00000000 },
-            };
-            struct sock_fprog prog={sizeof(bpf_syn_ack)/sizeof(bpf_syn_ack[0]),bpf_syn_ack};
-            setsockopt(fd_recv,SOL_SOCKET,SO_ATTACH_FILTER,&prog,sizeof(prog));
+            if(recv_off>0){
+                // AF_PACKET BPF: filter SYN-ACK (with Ethernet header offset)
+                struct sock_filter bpf_syn_ack[] = {
+                    { 0x28, 0, 0, 0x0000000c },
+                    { 0x15, 0, 5, 0x00000800 },
+                    { 0x30, 0, 0, 0x00000017 },
+                    { 0x15, 0, 3, 0x00000006 },
+                    { 0x28, 0, 0, 0x00000014 },
+                    { 0x45, 1, 0, 0x00001fff },
+                    { 0xb1, 0, 0, 0x0000000e },
+                    { 0x50, 0, 0, 0x0000001b },
+                    { 0x54, 0, 0, 0x00000012 },
+                    { 0x15, 0, 1, 0x00000012 },
+                    { 0x6, 0, 0, 0x00040000 },
+                    { 0x6, 0, 0, 0x00000000 },
+                };
+                struct sock_fprog prog={sizeof(bpf_syn_ack)/sizeof(bpf_syn_ack[0]),bpf_syn_ack};
+                setsockopt(fd_recv,SOL_SOCKET,SO_ATTACH_FILTER,&prog,sizeof(prog));
+            } else {
+                // SOCK_RAW BPF: filter SYN-ACK (IP header at offset 0, no Ethernet)
+                struct sock_filter bpf_syn_ack_raw[] = {
+                    { 0x28, 0, 0, 0x00000006 },
+                    { 0x45, 5, 0, 0x00001fff },
+                    { 0xb1, 0, 0, 0x00000000 },
+                    { 0x50, 0, 0, 0x0000000d },
+                    { 0x54, 0, 0, 0x00000012 },
+                    { 0x15, 0, 1, 0x00000012 },
+                    { 0x6, 0, 0, 0x00040000 },
+                    { 0x6, 0, 0, 0x00000000 },
+                };
+                struct sock_fprog prog={sizeof(bpf_syn_ack_raw)/sizeof(bpf_syn_ack_raw[0]),bpf_syn_ack_raw};
+                setsockopt(fd_recv,SOL_SOCKET,SO_ATTACH_FILTER,&prog,sizeof(prog));
+            }
             int rb=512*1024; setsockopt(fd_recv,SOL_SOCKET,SO_RCVBUF,&rb,sizeof(rb));
         }
 
@@ -2249,10 +2287,10 @@ void *worker_thread(void *arg) {
             // 2. Recv SYN-ACK
             int rcvd=0;
             while((rcvd=recv(fd_recv,recv_buf,4096,MSG_DONTWAIT))>0){
-                if(rcvd<V17ETH+V17IP+20) continue;
-                struct iphdr *rih=(struct iphdr*)(recv_buf+V17ETH);
+                if(rcvd<recv_off+V17IP+20) continue;
+                struct iphdr *rih=(struct iphdr*)(recv_buf+recv_off);
                 if(rih->protocol!=IPPROTO_TCP) continue;
-                struct tcphdr *rth=(struct tcphdr*)(recv_buf+V17ETH+(rih->ihl<<2));
+                struct tcphdr *rth=(struct tcphdr*)(recv_buf+recv_off+(rih->ihl<<2));
                 if(!(rth->syn && rth->ack)) continue;
                 unsigned short dport=ntohs(rth->dest);
                 

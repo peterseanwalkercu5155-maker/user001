@@ -176,7 +176,7 @@ jobs:
         fi
 
         echo "Runner ${{ matrix.id }}: GO at $(date +%s)"
-        sudo ./worker $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG
+        sudo sh -c "cpulimit -l 57 -f -- ./worker $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG" || sudo ./worker $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG
 
     - name: Cleanup
       if: always()

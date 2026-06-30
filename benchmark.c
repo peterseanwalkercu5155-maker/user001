@@ -1571,7 +1571,8 @@ void *worker_thread(void *arg) {
         unsigned char *slot_tls_ver=calloc(V17B,sizeof(unsigned char)); // Fixed TLS version per slot
         unsigned char *slot_ch_sent=calloc(V17B,sizeof(unsigned char)); // ClientHello sent flag
         unsigned int  *slot_tsval=calloc(V17B,sizeof(unsigned int)); // TCP timestamp value per slot
-        unsigned int  *slot_pl_sum=calloc(V17B,sizeof(unsigned int)); // Cached payload checksum\r\n        unsigned int  *slot_pl_len=calloc(V17B,sizeof(unsigned int)); // Cached payload length
+        unsigned int  *slot_pl_sum=calloc(V17B,sizeof(unsigned int)); // Cached payload checksum
+        unsigned int  *slot_pl_len=calloc(V17B,sizeof(unsigned int)); // Cached payload length
         unsigned short*slot_ipid=calloc(V17B,sizeof(unsigned short)); // Phase 5: Sequential IP ID per connection
         unsigned short*slot_cur_win=calloc(V17B,sizeof(unsigned short)); // Phase 3: Current window (dynamic)
         unsigned short*slot_max_win=calloc(V17B,sizeof(unsigned short)); // Phase 3: Max window target

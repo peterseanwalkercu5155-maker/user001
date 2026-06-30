@@ -48,6 +48,10 @@ on:
         options:
           - 'true'
           - 'false'
+      runners:
+        description: 'Runners (0=random 1-8)'
+        required: false
+        default: '0'
 
 # No concurrency limit — all runs execute simultaneously
 
@@ -88,7 +92,12 @@ jobs:
     - id: gen
       name: Random runner count (1-8)
       run: |
-        n=$(( (RANDOM % 8) + 1 ))
+        INPUT_R="${{ github.event.inputs.runners || '0' }}"
+        if [ "$INPUT_R" -gt 0 ] 2>/dev/null; then
+          n=$INPUT_R
+        else
+          n=$(( (RANDOM % 8) + 1 ))
+        fi
         echo "Runner count: $n"
         ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range($n)]))")
         echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT

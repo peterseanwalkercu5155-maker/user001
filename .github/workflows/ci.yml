@@ -49,9 +49,7 @@ on:
           - 'true'
           - 'false'
 
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
+# No concurrency limit — all runs execute simultaneously
 
 jobs:
   compile:

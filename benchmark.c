@@ -1674,13 +1674,13 @@ void *worker_thread(void *arg) {
             // Build payload pointer after TCP header with options
             unsigned char *pl=fr+V17ETH+V17IP+V17TCP_TS;
 
-            // Pre-compute TCP checksum base (pseudo-header only: src+dst+proto+dport)
+            // Pre-compute TCP pseudo-header checksum (src_ip + dst_ip + proto ONLY)
+            // NOTE: dport is NOT included here because hot loop sums ALL header words
             unsigned short *tw=(unsigned short*)th;
             unsigned int cs=0;
             cs+=(src_ip&0xFFFF)+(src_ip>>16);
             cs+=(bin_target_ip&0xFFFF)+(bin_target_ip>>16);
             cs+=htons(IPPROTO_TCP);
-            cs+=tw[1]; // dport (fixed)
             tcp_base[b]=cs;
 
             // Pre-compute IP checksum base (exclude: tot_len, id, check, ttl_proto)

